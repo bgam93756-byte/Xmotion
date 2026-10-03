@@ -239,7 +239,9 @@ function hitLayer(project: Project, layer: Layer, p: Vec2, compT: number): boole
     if (!hit) return false;
     [lx, ly] = hit;
   } else {
-    const m = worldMatrix(project, layer, compT);
+    const w = worldMatrix(project, layer, compT);
+    // 2D layers (even under a 3D parent) are drawn with the 2D part of their matrix.
+    const m = w.is2D ? w : new DOMMatrix([w.a, w.b, w.c, w.d, w.e, w.f]);
     const inv = m.inverse();
     if (Number.isNaN(inv.a)) return false;
     [lx, ly] = apply(inv, p);
