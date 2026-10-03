@@ -1,24 +1,29 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactElement } from 'react';
-import type { Keyframe, Layer, Project } from '../model/types';
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from 'react';
+import type { Keyframe, Layer, MaskMode, Project } from '../model/types';
 import { findDef } from '../model/schema';
 import { EFFECT_DEFS } from '../model/effectDefs';
+import { isInside, walk } from '../model/tree';
 import { media } from '../engine/media';
 import {
   endMerge,
   frameTime,
   layerById,
   moveKey,
+  moveLayerTo,
+  openGraph,
   openSheet,
   patchLayer,
   select,
+  setCollapsed,
   setTime,
   stop,
+  toggleSelect,
   update,
   useEditor,
-  type KeySel,
 } from '../state/store';
 import { haptic } from '../platform';
 import { Icon, type IconName } from './icons';
+import './timeline.css';
 
 const TYPE_ICON: Record<Layer['type'], IconName> = {
   shape: 'polygon',
@@ -37,16 +42,63 @@ export function layerIcon(l: Layer): IconName {
   return TYPE_ICON[l.type];
 }
 
+const MASK_LABEL: Record<MaskMode, string> = {
+  none: '',
+  alpha: 'Alpha mask',
+  alphaInv: 'Inverted alpha mask',
+  luma: 'Luma mask',
+  lumaInv: 'Inverted luma mask',
+};
+
+/** Hold time (ms) for a long-press on a row header (adds/removes it from the selection). */
+const LONG_PRESS = 450;
+const RULER_H = 26;
+
 interface Geo {
   pps: number;
   padL: number;
   fps: number;
+  duration: number;
 }
 
-/** All animated property paths of a layer, with display labels. */
+/** A layer row: the layer tree flattened depth first, without the children of closed groups. */
+interface Row {
+  layer: Layer;
+  /** The group holding the layer (null at the root). */
+  group: Layer | null;
+  index: number;
+  depth: number;
+  /** Name of the closest time-remapped group around the layer. */
+  retimedBy: string | null;
+  /** The layer or a group around it is hidden. */
+  hidden: boolean;
+}
+
+function visibleRows(list: Layer[], group: Layer | null = null, depth = 0, retimedBy: string | null = null, hiddenIn = false, out: Row[] = []): Row[] {
+  list.forEach((layer, index) => {
+    const hidden = hiddenIn || !layer.visible;
+    out.push({ layer, group, index, depth, retimedBy, hidden });
+    if (layer.type === 'group' && !layer.collapsed && layer.children?.length)
+      visibleRows(layer.children, layer, depth + 1, layer.timeRemapOn ? layer.name : retimedBy, hidden, out);
+  });
+  return out;
+}
+
+/** Drop position while reordering rows: above/below a row in its container, or into a group (at the top). */
+interface Drop {
+  target: string;
+  mode: 'above' | 'below' | 'into';
+}
+
+type MarkKind = 'top' | 'bottom' | 'into';
+
+/** All animated property paths of a layer, with display labels (time remapping first). */
 function animatedPaths(l: Layer): { path: string; label: string; keys: Keyframe[] }[] {
   const out: { path: string; label: string; keys: Keyframe[] }[] = [];
-  for (const [k, p] of Object.entries(l.props)) if (p.keys?.length) out.push({ path: k, label: findDef(l, k)?.label ?? k, keys: p.keys });
+  const remap = l.timeRemapOn ? l.props.timeRemap : undefined;
+  if (remap?.keys?.length) out.push({ path: 'timeRemap', label: findDef(l, 'timeRemap')?.label ?? 'Time remap', keys: remap.keys });
+  for (const [k, p] of Object.entries(l.props))
+    if (k !== 'timeRemap' && p.keys?.length) out.push({ path: k, label: findDef(l, k)?.label ?? k, keys: p.keys });
   for (const e of l.effects)
     for (const [k, p] of Object.entries(e.props))
       if (p.keys?.length) {
@@ -56,9 +108,217 @@ function animatedPaths(l: Layer): { path: string; label: string; keys: Keyframe[
   return out;
 }
 
+/**
+ * Moves a (draft) layer's in point to `ns` while its content stays where it is
+ * in time: media trim, keyframes (relative to start) and time remapping compensate.
+ */
+function setInPoint(l: Layer, ns: number) {
+  const delta = ns - l.start;
+  if (l.trimIn !== undefined) l.trimIn = Math.max(0, l.trimIn + delta * (l.speed ?? 1));
+  for (const [key, pr] of Object.entries(l.props)) {
+    // Remap values are seconds after the start, so they shift with it too.
+    const remap = key === 'timeRemap' && !!l.timeRemapOn;
+    pr.keys?.forEach((k) => {
+      k.t -= delta;
+      if (remap) k.v = (k.v as number) - delta;
+    });
+    if (remap && !pr.keys?.length) pr.value = (pr.value as number) - delta;
+  }
+  for (const e of l.effects) for (const pr of Object.values(e.props)) pr.keys?.forEach((k) => (k.t -= delta));
+  l.start = ns;
+}
+
+interface RowGestures {
+  down(e: React.PointerEvent, id: string): void;
+  move(e: React.PointerEvent): void;
+  up(e: React.PointerEvent): void;
+  cancel(e: React.PointerEvent): void;
+  click(e: React.MouseEvent, id: string): void;
+}
+
+interface Gesture {
+  id: string;
+  pointer: number;
+  x0: number;
+  y0: number;
+  y: number;
+  /** Mouse anywhere on the header, touch only from the layer icon (the rest scrolls). */
+  canDrag: boolean;
+  dragging: boolean;
+  timer: number;
+  raf: number;
+}
+
+/**
+ * Row header gestures: tap selects (double tap opens properties), Ctrl/Cmd/Shift
+ * click or long-press toggles multi-selection, dragging reorders the layer tree.
+ */
+function useRowGestures(scrollRef: { current: HTMLDivElement | null }, rowsRef: { current: Row[] }) {
+  const [reorder, setReorder] = useState<{ id: string; drop: Drop | null } | null>(null);
+  const gesture = useRef<Gesture | null>(null);
+  const suppressClick = useRef(false);
+  const lastTap = useRef({ id: '', at: 0 });
+
+  const api = useMemo(() => {
+    const rowOf = (id: string) => rowsRef.current.find((r) => r.layer.id === id);
+
+    /** Where a dragged layer would land with the pointer at clientY (null if nowhere valid). */
+    const dropAt = (y: number, dragId: string): Drop | null => {
+      const el = scrollRef.current;
+      const p = useEditor.getState().project;
+      const rows = rowsRef.current;
+      if (!el || !p || !rows.length) return null;
+      const blocks = [...el.querySelectorAll<HTMLElement>('.tl-block')];
+      if (!blocks.length) return null;
+      let drop: Drop | null = null;
+      if (y < blocks[0].getBoundingClientRect().top) drop = { target: rows[0].layer.id, mode: 'above' };
+      else if (y >= blocks[blocks.length - 1].getBoundingClientRect().bottom) {
+        const last = rows.findLast((r) => r.depth === 0);
+        if (last) drop = { target: last.layer.id, mode: 'below' };
+      } else
+        for (const b of blocks) {
+          const r = b.getBoundingClientRect();
+          if (y < r.top || y >= r.bottom) continue;
+          const row = rowOf(b.dataset.id ?? '');
+          if (!row) break;
+          const group = row.layer.type === 'group';
+          const main = (b.firstElementChild as HTMLElement).getBoundingClientRect();
+          if (y < main.bottom) {
+            const f = (y - main.top) / main.height;
+            drop = { target: row.layer.id, mode: group ? (f < 0.3 ? 'above' : f > 0.7 ? 'below' : 'into') : f < 0.5 ? 'above' : 'below' };
+          } else drop = { target: row.layer.id, mode: group ? 'into' : 'below' };
+          break;
+        }
+      if (!drop || drop.target === dragId) return null;
+      const row = rowOf(drop.target);
+      const container = drop.mode === 'into' ? drop.target : (row?.group?.id ?? null);
+      // A group can't go into itself or one of its own groups.
+      if (!row || (container && (container === dragId || isInside(p, container, dragId)))) return null;
+      return drop;
+    };
+
+    const show = (g: Gesture) => {
+      const drop = dropAt(g.y, g.id);
+      setReorder((prev) => (prev?.id === g.id && prev.drop?.target === drop?.target && prev.drop?.mode === drop?.mode ? prev : { id: g.id, drop }));
+    };
+
+    // Scrolls the list while a dragged row is held near the top or bottom edge.
+    const autoScroll = () => {
+      const g = gesture.current;
+      const el = scrollRef.current;
+      if (!g?.dragging || !el) return;
+      const b = el.getBoundingClientRect();
+      const top = b.top + RULER_H + 24;
+      const bottom = b.bottom - 24;
+      const v = g.y < top ? g.y - top : g.y > bottom ? g.y - bottom : 0;
+      if (v) {
+        const before = el.scrollTop;
+        el.scrollTop += Math.max(-14, Math.min(14, v / 2));
+        if (el.scrollTop !== before) show(g);
+      }
+      g.raf = requestAnimationFrame(autoScroll);
+    };
+
+    const apply = (id: string, drop: Drop) => {
+      const row = rowOf(drop.target);
+      if (!row) return;
+      if (drop.mode === 'into') {
+        moveLayerTo(id, row.layer.id, 0);
+        if (row.layer.collapsed) setCollapsed(row.layer.id, false);
+      } else moveLayerTo(id, row.group?.id ?? null, row.index + (drop.mode === 'below' ? 1 : 0));
+      haptic();
+    };
+
+    const finish = (commit: boolean) => {
+      const g = gesture.current;
+      gesture.current = null;
+      if (!g) return;
+      clearTimeout(g.timer);
+      cancelAnimationFrame(g.raf);
+      if (!g.dragging) return;
+      const drop = commit ? dropAt(g.y, g.id) : null;
+      setReorder(null);
+      if (drop) apply(g.id, drop);
+    };
+
+    const gestures: RowGestures = {
+      down(e, id) {
+        if (e.button !== 0 || (e.target as Element).closest('button')) return;
+        suppressClick.current = false;
+        finish(false);
+        const mouse = e.pointerType === 'mouse';
+        const g: Gesture = {
+          id,
+          pointer: e.pointerId,
+          x0: e.clientX,
+          y0: e.clientY,
+          y: e.clientY,
+          canDrag: mouse || !!(e.target as Element).closest('.tl-grip'),
+          dragging: false,
+          timer: 0,
+          raf: 0,
+        };
+        if (!mouse)
+          g.timer = window.setTimeout(() => {
+            if (gesture.current !== g) return;
+            gesture.current = null;
+            suppressClick.current = true;
+            toggleSelect(id);
+            haptic('medium');
+          }, LONG_PRESS);
+        if (g.canDrag) (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        gesture.current = g;
+      },
+      move(e) {
+        const g = gesture.current;
+        if (!g || e.pointerId !== g.pointer) return;
+        g.y = e.clientY;
+        if (!g.dragging) {
+          if (Math.hypot(e.clientX - g.x0, e.clientY - g.y0) < 6) return;
+          clearTimeout(g.timer);
+          if (!g.canDrag) {
+            // Touch outside the icon: the list scrolls instead.
+            gesture.current = null;
+            return;
+          }
+          g.dragging = true;
+          suppressClick.current = true;
+          haptic();
+          g.raf = requestAnimationFrame(autoScroll);
+        }
+        show(g);
+      },
+      up(e) {
+        if (gesture.current?.pointer === e.pointerId) finish(true);
+      },
+      cancel(e) {
+        if (gesture.current?.pointer === e.pointerId) finish(false);
+      },
+      click(e, id) {
+        if (suppressClick.current) {
+          suppressClick.current = false;
+          return;
+        }
+        haptic();
+        if (e.ctrlKey || e.metaKey || e.shiftKey) return toggleSelect(id);
+        const now = Date.now();
+        const double = lastTap.current.id === id && now - lastTap.current.at < 350;
+        lastTap.current = { id, at: double ? 0 : now };
+        select(id);
+        if (double) openSheet('props');
+      },
+    };
+    return { gestures, cancel: () => finish(false) };
+  }, [scrollRef, rowsRef]);
+
+  useEffect(() => api.cancel, [api]);
+  return { ...api, reorder };
+}
+
 export function Timeline() {
   const project = useEditor((s) => s.project)!;
   const selectedId = useEditor((s) => s.selectedId);
+  const selection = useEditor((s) => s.selection);
   const pps = useEditor((s) => s.tlZoom);
   const keySel = useEditor((s) => s.keySel);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -67,11 +327,40 @@ export function Timeline() {
   const pinch = useRef<{ d0: number; z0: number } | null>(null);
   const touches = useRef(new Map<number, number>());
 
-  const NW = width < 700 ? 124 : 184;
+  const NW = width < 700 ? 136 : 196;
+  /** Indent per tree level (px). */
+  const step = width < 700 ? 9 : 14;
   const trackView = Math.max(50, width - NW);
   const padL = trackView / 2;
-  const geo: Geo = { pps, padL, fps: project.fps };
+  const geo = useMemo<Geo>(() => ({ pps, padL, fps: project.fps, duration: project.duration }), [pps, padL, project.fps, project.duration]);
   const trackW = padL * 2 + project.duration * pps;
+
+  const rows = useMemo(() => visibleRows(project.layers), [project.layers]);
+  const rowsRef = useRef(rows);
+  useLayoutEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
+  const hasGroups = rows.some((r) => r.layer.type === 'group');
+  const selected = new Set(selection.length ? selection : selectedId ? [selectedId] : []);
+  const { gestures, cancel: cancelRowDrag, reorder } = useRowGestures(scrollRef, rowsRef);
+
+  // Drop indicator: a line above/below a row (below an open group = after its last visible
+  // descendant), or a highlighted group row for "into".
+  const marks = useMemo(() => {
+    const m = new Map<string, { kind: MarkKind; depth: number }>();
+    const d = reorder?.drop;
+    const i = d ? rows.findIndex((r) => r.layer.id === d.target) : -1;
+    if (!d || i < 0) return m;
+    const r = rows[i];
+    if (d.mode === 'above') m.set(r.layer.id, { kind: 'top', depth: r.depth });
+    else if (d.mode === 'into') m.set(r.layer.id, { kind: 'into', depth: r.depth + 1 });
+    else {
+      let j = i;
+      while (j + 1 < rows.length && rows[j + 1].depth > r.depth) j++;
+      m.set(rows[j].layer.id, { kind: 'bottom', depth: r.depth });
+    }
+    return m;
+  }, [reorder, rows]);
 
   useLayoutEffect(() => {
     const el = scrollRef.current!;
@@ -124,7 +413,7 @@ export function Timeline() {
   }, []);
 
   return (
-    <div className="timeline" style={{ ['--nw' as string]: `${NW}px` }}>
+    <div className={`timeline ${reorder ? 'reordering' : ''}`} style={{ ['--nw' as string]: `${NW}px` }}>
       <div
         ref={scrollRef}
         className="tl-scroll"
@@ -133,6 +422,7 @@ export function Timeline() {
           touches.current.set(e.pointerId, e.clientX);
           if (useEditor.getState().playing) stop();
           if (touches.current.size === 2) {
+            cancelRowDrag();
             const [a, b] = [...touches.current.values()];
             pinch.current = { d0: Math.abs(b - a) || 1, z0: pps };
           }
@@ -167,10 +457,30 @@ export function Timeline() {
             </div>
             <Ruler project={project} geo={geo} width={trackW} />
           </div>
-          {project.layers.map((l) => (
-            <LayerRows key={l.id} layer={l} project={project} geo={geo} trackW={trackW} selected={l.id === selectedId} keySel={keySel} />
-          ))}
-          {!project.layers.length && (
+          {rows.map((r) => {
+            const mark = marks.get(r.layer.id);
+            return (
+              <LayerRows
+                key={r.layer.id}
+                layer={r.layer}
+                indent={Math.min(r.depth, 4) * step}
+                caretSpace={hasGroups}
+                retimedBy={r.retimedBy}
+                dimmed={r.hidden}
+                parentName={r.layer.parent ? (layerById(project, r.layer.parent)?.name ?? null) : null}
+                geo={geo}
+                trackW={trackW}
+                selected={selected.has(r.layer.id)}
+                primary={r.layer.id === selectedId}
+                keyId={keySel?.layerId === r.layer.id ? keySel.keyId : null}
+                mark={mark?.kind ?? null}
+                markIndent={mark ? Math.min(mark.depth, 4) * step : 0}
+                dragging={reorder?.id === r.layer.id}
+                gestures={gestures}
+              />
+            );
+          })}
+          {!rows.length && (
             <div className="tl-empty" style={{ left: NW + 12 }}>
               Tap <b>+ Add</b> to add text, shapes, photos, video or music.
             </div>
@@ -217,58 +527,111 @@ function formatRuler(t: number, step: number) {
 
 const LayerRows = memo(function LayerRows({
   layer,
-  project,
+  indent,
+  caretSpace,
+  retimedBy,
+  dimmed,
+  parentName,
   geo,
   trackW,
   selected,
-  keySel,
+  primary,
+  keyId,
+  mark,
+  markIndent,
+  dragging,
+  gestures,
 }: {
   layer: Layer;
-  project: Project;
+  /** Header indent for the tree depth (px). */
+  indent: number;
+  /** Reserve room for a group caret so icons line up. */
+  caretSpace: boolean;
+  retimedBy: string | null;
+  /** Hidden itself or inside a hidden group. */
+  dimmed: boolean;
+  parentName: string | null;
   geo: Geo;
   trackW: number;
   selected: boolean;
-  keySel: KeySel | null;
+  primary: boolean;
+  keyId: string | null;
+  mark: MarkKind | null;
+  markIndent: number;
+  dragging: boolean;
+  gestures: RowGestures;
 }) {
   const expanded = useEditor((s) => s.expanded[layer.id]);
+  const graphPath = useEditor((s) => (s.graph?.layerId === layer.id ? s.graph.path : null));
   const paths = animatedPaths(layer);
-  const showKeys = (selected || expanded) && paths.length > 0;
+  // Keyframe lanes follow the selection unless opened/closed explicitly.
+  const showKeys = paths.length > 0 && (expanded ?? primary);
+  const isGroup = layer.type === 'group';
   const toggleVis = () => patchLayer(layer.id, { visible: !layer.visible });
+
+  const badges: { icon: IconName; title: string }[] = [];
+  if (layer.maskMode && layer.maskMode !== 'none') badges.push({ icon: 'mask', title: MASK_LABEL[layer.maskMode] });
+  if (layer.threeD) badges.push({ icon: 'cube', title: '3D layer' });
+  if (layer.timeRemapOn) badges.push({ icon: 'clock', title: 'Time remapping' });
+  if (parentName) badges.push({ icon: 'link', title: `Parent: ${parentName}` });
+
   return (
-    <>
-      <div className={`tl-row ${selected ? 'selected' : ''} ${layer.visible ? '' : 'hidden-layer'}`}>
+    <div
+      className={`tl-block ${dragging ? 'dragging' : ''} ${mark ? `drop-${mark}` : ''}`}
+      data-id={layer.id}
+      style={{ ['--ind' as string]: `${indent}px`, ['--mind' as string]: `${markIndent}px` }}
+    >
+      <div className={`tl-row main ${selected ? 'selected' : ''} ${dimmed ? 'hidden-layer' : ''} ${isGroup ? 'group' : ''}`}>
         <div
           className="tl-name"
-          onClick={() => {
-            select(layer.id);
-            haptic();
-          }}
-          onDoubleClick={() => openSheet('props')}
-          draggable
-          onDragStart={(e) => e.dataTransfer.setData('text/x-layer', layer.id)}
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            const id = e.dataTransfer.getData('text/x-layer');
-            if (!id || id === layer.id) return;
-            update((p) => {
-              const from = p.layers.findIndex((l) => l.id === id);
-              const [l] = p.layers.splice(from, 1);
-              p.layers.splice(p.layers.findIndex((x) => x.id === layer.id), 0, l);
-            });
-          }}
+          onPointerDown={(e) => gestures.down(e, layer.id)}
+          onPointerMove={gestures.move}
+          onPointerUp={gestures.up}
+          onPointerCancel={gestures.cancel}
+          onClick={(e) => gestures.click(e, layer.id)}
+          onDoubleClick={(e) => !(e.ctrlKey || e.metaKey || e.shiftKey) && openSheet('props')}
+          onContextMenu={(e) => e.preventDefault()}
         >
-          <span className="tl-icon" style={{ color: layer.label }}>
+          {isGroup ? (
+            <button
+              type="button"
+              className="tl-caret"
+              aria-label={layer.collapsed ? 'Open group' : 'Close group'}
+              aria-expanded={!layer.collapsed}
+              onClick={(e) => {
+                e.stopPropagation();
+                setCollapsed(layer.id, !layer.collapsed);
+                haptic();
+              }}
+            >
+              <Icon name={layer.collapsed ? 'next' : 'down'} size={13} />
+            </button>
+          ) : (
+            caretSpace && <span className="tl-caret-space" />
+          )}
+          <span className="tl-icon tl-grip" style={{ color: layer.label }} title="Drag to reorder">
             <Icon name={layerIcon(layer)} size={15} />
           </span>
-          <span className="tl-label">{layer.name}</span>
+          <span className="tl-text">
+            <span className="tl-label">{layer.name}</span>
+            {badges.length > 0 && (
+              <span className="tl-badges">
+                {badges.map((b) => (
+                  <span key={b.icon} role="img" title={b.title} aria-label={b.title}>
+                    <Icon name={b.icon} size={10} />
+                  </span>
+                ))}
+              </span>
+            )}
+          </span>
           {paths.length > 0 && (
             <button
               type="button"
               className="tl-mini"
-              title="Show keyframes"
+              title={showKeys ? 'Hide keyframes' : 'Show keyframes'}
               onClick={(e) => {
                 e.stopPropagation();
-                useEditor.setState((s) => ({ expanded: { ...s.expanded, [layer.id]: !expanded } }));
+                useEditor.setState((s) => ({ expanded: { ...s.expanded, [layer.id]: !showKeys } }));
               }}
             >
               <Icon name={showKeys ? 'down' : 'next'} size={12} />
@@ -287,7 +650,7 @@ const LayerRows = memo(function LayerRows({
           </button>
         </div>
         <div className="tl-track" style={{ width: trackW }}>
-          <ClipBar layer={layer} project={project} geo={geo} selected={selected} paths={paths} />
+          <ClipBar layer={layer} geo={geo} selected={selected} primary={primary} paths={paths} retimedBy={retimedBy} />
         </div>
       </div>
       {showKeys &&
@@ -295,29 +658,71 @@ const LayerRows = memo(function LayerRows({
           <div key={p.path} className="tl-row sub">
             <div className="tl-name sub" title={p.label}>
               <span className="tl-label">{p.label}</span>
+              <button
+                type="button"
+                className={`tl-graph ${graphPath === p.path ? 'on' : ''}`}
+                title="Graph editor"
+                aria-label={`${p.label} curves`}
+                onClick={() => openGraph(graphPath === p.path ? null : layer.id, p.path)}
+              >
+                <Icon name="graph" size={12} />
+              </button>
             </div>
             <div className="tl-track" style={{ width: trackW }}>
               {p.keys.map((k) => (
-                <Diamond key={k.id} layer={layer} path={p.path} k={k} geo={geo} selected={keySel?.keyId === k.id} />
+                <Diamond key={k.id} layer={layer} path={p.path} k={k} geo={geo} selected={keyId === k.id} />
               ))}
             </div>
           </div>
         ))}
-    </>
+    </div>
   );
 });
 
-function ClipBar({ layer, project, geo, selected, paths }: { layer: Layer; project: Project; geo: Geo; selected: boolean; paths: { keys: Keyframe[] }[] }) {
+/** Start/end of every layer inside a group (any depth), by id. */
+function spansInside(groupId: string): Map<string, [number, number]> {
+  const out = new Map<string, [number, number]>();
+  const p = useEditor.getState().project;
+  walk((p && layerById(p, groupId)?.children) || [], (c) => void out.set(c.id, [c.start, c.end]));
+  return out;
+}
+
+function ClipBar({
+  layer,
+  geo,
+  selected,
+  primary,
+  paths,
+  retimedBy,
+}: {
+  layer: Layer;
+  geo: Geo;
+  selected: boolean;
+  primary: boolean;
+  paths: { keys: Keyframe[] }[];
+  retimedBy: string | null;
+}) {
   const left = geo.padL + layer.start * geo.pps;
   const w = Math.max(4, (layer.end - layer.start) * geo.pps);
-  const drag = useRef<{ mode: 'move' | 'l' | 'r'; x0: number; start: number; end: number; moved: boolean; id: number } | null>(null);
+  const drag = useRef<{
+    mode: 'move' | 'l' | 'r';
+    x0: number;
+    start: number;
+    end: number;
+    moved: boolean;
+    id: number;
+    /** Moving a group: start/end of every layer inside it when the drag began. */
+    kids: Map<string, [number, number]> | null;
+  } | null>(null);
   const lastTap = useRef(0);
+  const isGroup = layer.type === 'group';
 
   const down = (mode: 'move' | 'l' | 'r') => (e: React.PointerEvent) => {
     e.stopPropagation();
     if (layer.locked && mode !== 'move') return;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    drag.current = { mode, x0: e.clientX, start: layer.start, end: layer.end, moved: false, id: e.pointerId };
+    const kids = isGroup && mode === 'move' ? spansInside(layer.id) : null;
+    drag.current = { mode, x0: e.clientX, start: layer.start, end: layer.end, moved: false, id: e.pointerId, kids };
     endMerge();
   };
   const move = (e: React.PointerEvent) => {
@@ -330,33 +735,46 @@ function ClipBar({ layer, project, geo, selected, paths }: { layer: Layer; proje
     if (layer.locked) return;
     const snap = (t: number) => {
       // Snap to the playhead and comp edges.
-      const targets = [useEditor.getState().time, 0, project.duration];
+      const targets = [useEditor.getState().time, 0, geo.duration];
       for (const s of targets) if (Math.abs(t - s) * geo.pps < 8) return s;
       return frameTime(t);
     };
     const dt = dxPx / geo.pps;
-    const minLen = 1 / project.fps;
+    const minLen = 1 / geo.fps;
+    const merge = `clip:${layer.id}:${d.id}`;
     if (d.mode === 'move') {
       const len = d.end - d.start;
       let ns = snap(Math.max(0, d.start + dt));
       const ne = snap(ns + len);
       if (Math.abs(ne - (ns + len)) > 1e-9) ns = ne - len;
-      patchLayer(layer.id, { start: Math.max(0, ns), end: Math.max(0, ns) + len }, `clip:${layer.id}:${d.id}`);
+      ns = Math.max(0, ns);
+      const kids = d.kids;
+      if (kids) {
+        // A group carries everything inside it along.
+        const delta = ns - d.start;
+        update((p) => {
+          const g = layerById(p, layer.id);
+          if (!g) return;
+          g.start = ns;
+          g.end = ns + len;
+          walk(g.children ?? [], (c) => {
+            const o = kids.get(c.id);
+            if (!o) return;
+            c.start = o[0] + delta;
+            c.end = o[1] + delta;
+          });
+        }, merge);
+      } else patchLayer(layer.id, { start: ns, end: ns + len }, merge);
     } else if (d.mode === 'l') {
+      // Groups trim only themselves; their layers keep their times.
       const ns = Math.min(d.end - minLen, Math.max(0, snap(d.start + dt)));
-      const delta = ns - layer.start;
       update((p) => {
         const l = layerById(p, layer.id);
-        if (!l) return;
-        // Keep content and keyframes where they are in comp time.
-        if (l.trimIn !== undefined) l.trimIn = Math.max(0, l.trimIn + delta * (l.speed ?? 1));
-        for (const pr of Object.values(l.props)) pr.keys?.forEach((k) => (k.t -= delta));
-        for (const e2 of l.effects) for (const pr of Object.values(e2.props)) pr.keys?.forEach((k) => (k.t -= delta));
-        l.start = ns;
-      }, `clip:${layer.id}:${d.id}`);
+        if (l && Math.abs(ns - l.start) > 1e-9) setInPoint(l, ns);
+      }, merge);
     } else {
       const ne = Math.max(d.start + minLen, snap(d.end + dt));
-      patchLayer(layer.id, { end: ne }, `clip:${layer.id}:${d.id}`);
+      patchLayer(layer.id, { end: ne }, merge);
     }
   };
   const up = (e: React.PointerEvent) => {
@@ -366,11 +784,12 @@ function ClipBar({ layer, project, geo, selected, paths }: { layer: Layer; proje
     (e.currentTarget as HTMLElement).releasePointerCapture(d.id);
     endMerge();
     if (!d.moved) {
+      haptic();
+      if (e.ctrlKey || e.metaKey || e.shiftKey) return toggleSelect(layer.id);
       const now = Date.now();
       if (now - lastTap.current < 350) openSheet('props');
       lastTap.current = now;
       select(layer.id);
-      haptic();
     }
   };
 
@@ -378,8 +797,9 @@ function ClipBar({ layer, project, geo, selected, paths }: { layer: Layer; proje
 
   return (
     <div
-      className={`clip ${selected ? 'selected' : ''} ${layer.locked ? 'locked' : ''}`}
+      className={`clip ${selected ? 'selected' : ''} ${layer.locked ? 'locked' : ''} ${isGroup ? 'group' : ''} ${retimedBy ? 'retimed' : ''}`}
       style={{ left, width: w, ['--c' as string]: layer.label }}
+      title={retimedBy ? `Runs on the time-remapped clock of "${retimedBy}": its start and end are in that group's time` : undefined}
       onPointerDown={down('move')}
       onPointerMove={move}
       onPointerUp={up}
@@ -390,7 +810,7 @@ function ClipBar({ layer, project, geo, selected, paths }: { layer: Layer; proje
       {keyTimes.map((t) => (
         <span key={t} className="clip-key" style={{ left: t * geo.pps }} />
       ))}
-      {selected && (
+      {primary && (
         <>
           <span className="clip-handle l" onPointerDown={down('l')} onPointerMove={move} onPointerUp={up} />
           <span className="clip-handle r" onPointerDown={down('r')} onPointerMove={move} onPointerUp={up} />
@@ -431,9 +851,10 @@ function Waveform({ layer, width }: { layer: Layer; width: number }) {
   return <canvas ref={ref} className="waveform" />;
 }
 
+/** A keyframe on its property lane, at layer.start + k.t; drag to retime, tap to jump to it. */
 function Diamond({ layer, path, k, geo, selected }: { layer: Layer; path: string; k: Keyframe; geo: Geo; selected: boolean }) {
   const drag = useRef<{ x0: number; t0: number; moved: boolean; id: number } | null>(null);
-  const sel: KeySel = { layerId: layer.id, path, keyId: k.id };
+  const sel = { layerId: layer.id, path, keyId: k.id };
   return (
     <span
       className={`diamond ${selected ? 'selected' : ''} ease-${k.ease}`}
@@ -443,7 +864,7 @@ function Diamond({ layer, path, k, geo, selected }: { layer: Layer; path: string
         e.stopPropagation();
         (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
         drag.current = { x0: e.clientX, t0: k.t, moved: false, id: e.pointerId };
-        useEditor.setState({ keySel: sel, selectedId: layer.id });
+        useEditor.setState({ keySel: sel, selectedId: layer.id, selection: [] });
         endMerge();
       }}
       onPointerMove={(e) => {

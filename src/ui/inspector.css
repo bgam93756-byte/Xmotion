@@ -1,0 +1,282 @@
+/* Inspector: property menu, anchor presets, layer options, groups and multi-selection.
+   styles.css loads after this file, so overrides of its classes use two class selectors. */
+
+/* ---------------- property label + menu ---------------- */
+
+.prop-label.prop-label-btn {
+  display: flex;
+  align-items: center;
+  min-height: 36px;
+  border: 0;
+  background: none;
+  padding: 0 4px 0 0;
+  margin: 0;
+  text-align: left;
+  border-radius: 7px;
+}
+
+.prop-label-btn > span {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.prop-label.prop-label-btn:hover,
+.prop-label.prop-label-btn.open {
+  color: var(--text);
+}
+
+.prop-label.prop-label-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.pm-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+}
+
+.menu.prop-menu {
+  position: fixed;
+  top: 0;
+  right: auto;
+  z-index: 61;
+  min-width: 210px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  animation: fade 0.12s ease;
+}
+
+.prop-menu-title {
+  padding: 8px 12px 7px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.menu.prop-menu button {
+  min-height: 40px;
+  font-size: 14px;
+}
+
+.menu.prop-menu button svg {
+  flex: none;
+  color: var(--muted);
+}
+
+.menu.prop-menu button.danger svg {
+  color: inherit;
+}
+
+.menu.prop-menu button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* ---------------- anchor presets ---------------- */
+
+.anchor-tools {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 0 4px;
+}
+
+.anchor-grid {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, 36px);
+  grid-template-rows: repeat(3, 36px);
+  flex: none;
+}
+
+/* The layer's bounds, through the corner points. */
+.anchor-grid::before {
+  content: '';
+  position: absolute;
+  inset: 18px;
+  border: 1px dashed var(--line);
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+.anchor-grid button {
+  position: relative;
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: none;
+  padding: 0;
+  border-radius: 8px;
+}
+
+.anchor-grid button:hover {
+  background: var(--panel3);
+}
+
+.anchor-grid button span {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--panel);
+  border: 1.5px solid var(--muted);
+}
+
+.anchor-grid button.on span {
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(124, 92, 255, 0.3);
+}
+
+.anchor-side {
+  flex: 1;
+  min-width: 0;
+}
+
+.chip.anchor-tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+}
+
+.anchor-side .hint {
+  margin-bottom: 0;
+}
+
+/* ---------------- layer options, groups, camera ---------------- */
+
+.hint.opt-hint {
+  margin: -4px 0 4px 100px;
+}
+
+@media (max-width: 380px) {
+  .hint.opt-hint {
+    margin-left: 0;
+  }
+}
+
+.in-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 36px;
+  padding: 6px 14px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel2);
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+}
+
+.in-group:hover {
+  color: var(--text);
+}
+
+.btn.group-ungroup {
+  margin-left: auto;
+  min-height: 36px;
+}
+
+.chips.group-kids {
+  margin: 6px 0 2px;
+}
+
+.group-kids .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cam-info {
+  padding: 4px 14px;
+}
+
+.hint.cam-note {
+  color: var(--key);
+}
+
+/* ---------------- effects clipboard ---------------- */
+
+.fx-clip {
+  display: flex;
+  gap: 8px;
+  margin: 2px 0 4px;
+}
+
+.fx-clip .btn {
+  flex: 1;
+  min-height: 36px;
+}
+
+/* ---------------- multi-selection ---------------- */
+
+.panel-head > .multi-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.multi-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.multi-actions .btn {
+  min-height: 44px;
+  justify-content: flex-start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.multi-actions .btn.wide {
+  grid-column: 1 / -1;
+  justify-content: center;
+}
+
+.multi-list {
+  display: grid;
+  gap: 2px;
+}
+
+.multi-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 9px;
+  background: none;
+  text-align: left;
+}
+
+.multi-item:hover {
+  background: var(--panel2);
+}
+
+.multi-item .ellipsis {
+  flex: 1;
+}
+
+.multi-item small {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: capitalize;
+}

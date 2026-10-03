@@ -1,35 +1,42 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { saveProject } from '../engine/storage';
 import { thumbnail } from '../engine/renderer';
+import { findLayer } from '../model/tree';
 import {
   closeProject,
-  copyLayer,
+  copyLayers,
   deleteKey,
-  deleteLayer,
-  duplicateLayer,
+  duplicateLayers,
+  groupLayers,
   layerById,
   moveLayer,
   openSheet,
   pasteLayer,
   redo,
   select,
+  selectedIds,
   setTime,
   splitLayer,
   stepFrames,
+  toast,
   togglePlay,
   undo,
+  ungroup,
   useEditor,
   type Sheet as SheetKind,
 } from '../state/store';
 import { Viewport } from './Viewport';
 import { Timeline } from './Timeline';
+import { GraphEditor } from './GraphEditor';
 import { Inspector } from './Inspector';
 import { ExportSheet } from './ExportSheet';
 import { AddSheet } from './AddSheet';
+import { MoreSheet } from './MoreSheet';
 import { HelpSheet } from './HelpSheet';
 import { Icon } from './icons';
 import { IconButton } from './controls/fields';
-import { addText, importFiles } from './actions';
+import { addText, deleteSelection, importFiles, selectAll } from './actions';
+import './sheets.css';
 
 export function formatTime(t: number, fps: number) {
   const m = Math.floor(t / 60);
@@ -53,13 +60,15 @@ function useWide() {
 export function Editor() {
   const wide = useWide();
   const sheet = useEditor((s) => s.sheet);
+  // The graph editor replaces the timeline while its layer exists.
+  const graph = useEditor((s) => !!s.graph && !!s.project && !!findLayer(s.project, s.graph.layerId));
   useAutosave();
   useShortcuts();
   const [dropping, setDropping] = useState(false);
 
   return (
     <div
-      className={`editor ${wide ? 'wide' : 'narrow'}`}
+      className={`editor ${wide ? 'wide' : 'narrow'} ${graph ? 'has-graph' : ''}`}
       onDragOver={(e) => {
         if (e.dataTransfer.types.includes('Files')) {
           e.preventDefault();
@@ -79,9 +88,7 @@ export function Editor() {
         <Viewport />
       </div>
       <Transport />
-      <div className="ed-timeline">
-        <Timeline />
-      </div>
+      <div className={`ed-timeline ${graph ? 'graphing' : ''}`}>{graph ? <GraphEditor /> : <Timeline />}</div>
       <BottomBar />
       {wide && (
         <aside className="ed-inspector">
@@ -96,6 +103,11 @@ export function Editor() {
       {sheet === 'add' && (
         <Sheet kind="add" title="Add layer">
           <AddSheet />
+        </Sheet>
+      )}
+      {sheet === 'more' && (
+        <Sheet kind="more" title="More">
+          <MoreSheet />
         </Sheet>
       )}
       {sheet === 'export' && (
@@ -189,7 +201,9 @@ function Transport() {
 
 function BottomBar() {
   const selectedId = useEditor((s) => s.selectedId);
+  const multi = useEditor((s) => s.selection.length > 1);
   const tool = useEditor((s) => s.tool);
+  const hasClip = useEditor((s) => !!s.clipboard?.layers.length);
   const project = useEditor((s) => s.project)!;
   const layer = layerById(project, selectedId);
   const Btn = ({ icon, label, onClick, active, primary }: { icon: Parameters<typeof Icon>[0]['name']; label: string; onClick: () => void; active?: boolean; primary?: boolean }) => (
@@ -199,20 +213,22 @@ function BottomBar() {
     </button>
   );
   return (
-    <nav className="bottombar">
+    <nav className={`bottombar ${layer ? 'bb-selected' : ''}`}>
       <Btn icon="plus" label="Add" primary onClick={() => openSheet('add')} />
       {layer ? (
         <>
           <Btn icon="settings" label="Edit" onClick={() => openSheet('props')} />
-          <Btn icon="scissors" label="Split" onClick={() => splitLayer(layer.id)} />
-          <Btn icon="copy" label="Duplicate" onClick={() => duplicateLayer(layer.id)} />
-          <Btn icon="trash" label="Delete" onClick={() => deleteLayer(layer.id)} />
+          {multi ? <Btn icon="group" label="Group" onClick={() => groupLayers()} /> : <Btn icon="scissors" label="Split" onClick={() => splitLayer(layer.id)} />}
+          <Btn icon="copy" label="Duplicate" onClick={() => duplicateLayers(selectedIds())} />
+          <Btn icon="trash" label="Delete" onClick={deleteSelection} />
+          <Btn icon="more" label="More" onClick={() => openSheet('more')} />
           <Btn icon="close" label="Done" onClick={() => select(null)} />
         </>
       ) : (
         <>
           <Btn icon="pen" label="Draw" active={tool === 'pen'} onClick={() => useEditor.setState({ tool: tool === 'pen' ? 'select' : 'pen' })} />
           <Btn icon="text" label="Text" onClick={addText} />
+          {hasClip && <Btn icon="paste" label="Paste" onClick={pasteLayer} />}
           <Btn icon="settings" label="Project" onClick={() => openSheet(matchMedia('(min-width: 900px)').matches ? null : 'project')} />
           <Btn icon="fit" label="Fit" onClick={() => window.dispatchEvent(new Event('xm:fit'))} />
         </>
@@ -286,12 +302,14 @@ function useShortcuts() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement;
-      if (el.closest('input, textarea, select, [contenteditable]')) return;
+      // Panels with their own keys (e.g. the graph editor) mark them handled.
+      if (e.defaultPrevented || el.closest('input, textarea, select, [contenteditable]')) return;
       const s = useEditor.getState();
       const p = s.project;
       if (!p) return;
       const mod = e.ctrlKey || e.metaKey;
       const sel = layerById(p, s.selectedId);
+      const ids = selectedIds();
       const k = e.key.toLowerCase();
       const handled = () => e.preventDefault();
       if (k === ' ') return handled(), togglePlay();
@@ -299,31 +317,49 @@ function useShortcuts() {
       if (mod && k === 'y') return handled(), redo();
       if (mod && k === 'e') return handled(), openSheet('export');
       if (mod && k === 'v') return handled(), pasteLayer();
+      if (mod && k === 'a') return handled(), selectAll();
       if (k === ',') return handled(), stepFrames(e.shiftKey ? -p.fps : -1);
       if (k === '.') return handled(), stepFrames(e.shiftKey ? p.fps : 1);
       if (k === 'home') return handled(), setTime(0);
       if (k === 'end') return handled(), setTime(p.duration);
-      if (k === 'escape') return handled(), s.sheet ? openSheet(null) : select(null);
+      if (k === 'escape') {
+        handled();
+        if (s.sheet) return openSheet(null);
+        if (s.tool === 'anchor') useEditor.setState({ tool: 'select' });
+        return select(null);
+      }
       if (k === '?') return handled(), openSheet('help');
       if (k === 'p' && !mod) return handled(), useEditor.setState({ tool: s.tool === 'pen' ? 'select' : 'pen' });
       if (k === 'v' && !mod) return handled(), useEditor.setState({ tool: 'select' });
+      if (k === 'y' && !mod) return handled(), useEditor.setState({ tool: s.tool === 'anchor' ? 'select' : 'anchor' });
       if (!sel) return;
       if (k === 'delete' || k === 'backspace') {
         handled();
         if (s.keySel) deleteKey(s.keySel);
-        else deleteLayer(sel.id);
+        else deleteSelection();
         return;
       }
-      if (mod && k === 'd') return handled(), duplicateLayer(sel.id);
-      if (mod && k === 'c') return handled(), copyLayer(sel.id);
-      if (mod && e.key === ']') return handled(), moveLayer(sel.id, p.layers.indexOf(sel) - 1);
-      if (mod && e.key === '[') return handled(), moveLayer(sel.id, p.layers.indexOf(sel) + 1);
+      if (mod && k === 'g') {
+        handled();
+        if (!e.shiftKey) return groupLayers(ids);
+        if (sel.type === 'group') return ungroup(sel.id);
+        return toast('Select a group to ungroup it');
+      }
+      if (mod && k === 'd') return handled(), duplicateLayers(ids);
+      if (mod && k === 'c') return handled(), copyLayers(ids);
+      if (mod && (e.key === ']' || e.key === '[')) {
+        handled();
+        const at = findLayer(p, sel.id);
+        const to = at ? at.index + (e.key === ']' ? -1 : 1) : -1;
+        if (at && to >= 0 && to < at.list.length) moveLayer(sel.id, to);
+        return;
+      }
       if (k === 's' && !mod) return handled(), splitLayer(sel.id);
       if (k.startsWith('arrow')) {
         handled();
         const n = e.shiftKey ? 10 : 1;
         const d = { arrowleft: [-n, 0], arrowright: [n, 0], arrowup: [0, -n], arrowdown: [0, n] }[k] as [number, number];
-        void import('./nudge').then((m) => m.nudge(sel.id, d));
+        void import('./nudge').then((m) => m.nudge(ids, d));
       }
     };
     window.addEventListener('keydown', onKey);

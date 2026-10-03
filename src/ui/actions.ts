@@ -1,8 +1,11 @@
 import type { LayerType, ShapeKind, Vec2 } from '../model/types';
-import { createLayer } from '../model/schema';
+import { createLayer, type NewLayerOpts } from '../model/schema';
+import { allLayers, findLayer } from '../model/tree';
 import { media } from '../engine/media';
 import { putAsset } from '../engine/storage';
-import { addLayer, openSheet, toast, update, useEditor } from '../state/store';
+import { worldMatrix } from '../engine/transform';
+import { addLayer, deleteLayers, layerById, openSheet, selectedIds, toast, update, useEditor } from '../state/store';
+import { saveAsElement } from '../state/elements';
 import { haptic, pickFiles } from '../platform';
 
 const get = () => useEditor.getState();
@@ -32,11 +35,49 @@ export function addText() {
   haptic();
 }
 
-export function addSpecial(type: Extract<LayerType, 'null' | 'adjustment'>) {
-  const p = get().project;
+export function addSpecial(type: Extract<LayerType, 'null' | 'adjustment' | 'camera' | 'group'>) {
+  const { project: p, time, selectedId } = get();
   if (!p) return;
-  addLayer(createLayer(p, type, { start: startTime() }));
+  const opts: NewLayerOpts = { start: startTime() };
+  if (type === 'group') {
+    // An empty group spans the whole comp and pivots on its position, so its
+    // transform is identity and layers moved into it later stay where they are.
+    const c: Vec2 = [Math.round(p.width / 2), Math.round(p.height / 2)];
+    const g = findLayer(p, selectedId)?.group;
+    const q = g ? worldMatrix(p, g, time).inverse().transformPoint(new DOMPoint(c[0], c[1])) : null;
+    const anchor: Vec2 = q && !Number.isNaN(q.x) ? [Math.round(q.x * 100) / 100, Math.round(q.y * 100) / 100] : c;
+    Object.assign(opts, { start: 0, end: p.duration, props: { position: { value: c }, anchor: { value: anchor } } });
+  }
+  // A camera films the whole comp, so it goes on top of the root (the top-most camera wins).
+  addLayer(createLayer(p, type, opts), type === 'camera' ? { group: null, index: 0 } : undefined);
   openSheet(null);
+  haptic();
+  if (type === 'camera' && !allLayers(p).some((l) => l.threeD)) toast('Turn on 3D for layers so the camera sees them');
+}
+
+/** Selects every layer in the selected layer's container (the root when nothing is selected). */
+export function selectAll() {
+  const { project: p, selectedId } = get();
+  if (!p) return;
+  const f = findLayer(p, selectedId);
+  const ids = (f ? f.list : p.layers).map((l) => l.id);
+  if (!ids.length) return;
+  useEditor.setState({ selectedId: f ? f.layer.id : ids[0], selection: ids.length > 1 ? ids : [], keySel: null });
+}
+
+export function deleteSelection() {
+  deleteLayers(selectedIds());
+}
+
+/** Asks for a name and saves the selected layers to the Elements library. */
+export async function saveSelectionAsElement() {
+  const { project: p } = get();
+  const ids = selectedIds();
+  const first = p && layerById(p, ids[0]);
+  if (!first) return toast('Select layers to save as an element');
+  const name = window.prompt('Element name', ids.length > 1 ? `${first.name} + ${ids.length - 1}` : first.name);
+  if (name === null) return;
+  await saveAsElement(name, ids);
 }
 
 export function addDrawing(points: Vec2[], color: string, width: number) {

@@ -38,6 +38,9 @@ export function timesOf(project: Project, layer: Layer, compT: number) {
   return { ec, ct, lt: layerTime(layer, ct, ec) };
 }
 
+/** Mask layers hide what's below them and are never drawn or picked themselves. */
+export const isMaskLayer = (l: Layer) => !!l.maskMode && l.maskMode !== 'none';
+
 export function isActive(layer: Layer, t: number) {
   return t >= layer.start && t < layer.end;
 }
@@ -195,7 +198,7 @@ function groupBounds(project: Project, group: Layer, compT: number): Rect {
     x1 = -Infinity,
     y1 = -Infinity;
   for (const c of kids) {
-    if (!c.visible || c.type === 'audio' || c.type === 'camera' || c.maskMode) continue;
+    if (!c.visible || c.type === 'audio' || c.type === 'camera' || isMaskLayer(c)) continue;
     const { ec, ct, lt } = timesOf(project, c, compT);
     if (!isActive(c, ct)) continue;
     const rel = inv.multiply(worldMatrix(project, c, compT));
@@ -264,7 +267,7 @@ export function hitTest(project: Project, p: Vec2, compT: number, selectedId?: s
   }
   const search = (list: Layer[], t: number): Layer | null => {
     for (const layer of list) {
-      if (!layer.visible || layer.locked || layer.maskMode || !isActive(layer, t)) continue;
+      if (!layer.visible || layer.locked || isMaskLayer(layer) || !isActive(layer, t)) continue;
       if (layer.type === 'group') {
         const inner = search(layer.children ?? [], layerTime(layer, t, ctxFor(project, layer)));
         if (inner) return open.has(layer.id) ? inner : layer;

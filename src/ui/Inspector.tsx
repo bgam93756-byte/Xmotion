@@ -1,40 +1,55 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { BlendMode, EaseName, Layer, Project, PropValue, ShapeKind, TextAnimator, TextAnimUnit, Vec2 } from '../model/types';
-import { evalPropAt, keyAt } from '../model/animate';
+import type { BlendMode, EaseName, Keyframe, Layer, MaskMode, Project, PropValue, ShapeKind, TextAnimator, TextAnimUnit, Vec2 } from '../model/types';
+import { evalPropAt, keyAt, vec } from '../model/animate';
 import { EASE_LABELS, applyEase, bezierFor } from '../model/easing';
 import { EFFECT_DEFS, EFFECT_LIST } from '../model/effectDefs';
 import { CATEGORIES as EFFECT_CATEGORIES } from '../effects';
 import { validateExpr } from '../model/expr';
 import { ANIM_PRESETS } from '../model/presets';
 import { PROJECT_PRESETS, getProp, propSections, type PropDef } from '../model/schema';
+import { allLayers, ancestors, findLayer } from '../model/tree';
 import { FONT_LIST, ensureFont } from '../engine/fonts';
 import { media } from '../engine/media';
-import { ctxFor } from '../engine/transform';
+import { activeCamera } from '../engine/camera';
+import { ctxFor, isRetimed, localBounds, propClock, timesOf } from '../engine/transform';
 import {
   addEffect,
+  copyEffects,
+  copyLayers,
   deleteKey,
   deleteLayer,
+  deleteLayers,
   duplicateLayer,
+  duplicateLayers,
+  groupLayers,
   layerById,
   moveLayer,
   openSheet,
+  pasteEffects,
   patchLayer,
   select,
+  selectedIds,
+  setAnchor,
   setExpr,
   setKeyEase,
   setParent,
   setPropValue,
   setTime,
+  setTimeRemap,
   splitLayer,
   toggleAnimated,
   toggleKeyAtPlayhead,
+  ungroup,
   update,
   useEditor,
 } from '../state/store';
+import { saveAsElement } from '../state/elements';
 import { BezierEditor, easePreview } from './controls/BezierEditor';
 import { ColorField, IconButton, NumberField, Section, Select, Slider, Toggle } from './controls/fields';
 import { Icon } from './icons';
+import { PropMenu, type MenuItem } from './PropMenu';
+import './inspector.css';
 
 const BLEND_MODES: { value: BlendMode; label: string }[] = [
   { value: 'normal', label: 'Normal' },
@@ -56,12 +71,88 @@ const BLEND_MODES: { value: BlendMode; label: string }[] = [
   { value: 'luminosity', label: 'Luminosity' },
 ];
 
+const MASK_MODES: { value: MaskMode; label: string }[] = [
+  { value: 'none', label: 'None' },
+  { value: 'alpha', label: 'Alpha mask' },
+  { value: 'alphaInv', label: 'Inverted alpha' },
+  { value: 'luma', label: 'Luma mask' },
+  { value: 'lumaInv', label: 'Inverted luma' },
+];
+
+/** Layer types offering each layer option. */
+const CAN_MASK = new Set(['shape', 'text', 'image', 'video', 'group']);
+const CAN_3D = new Set(['shape', 'text', 'image', 'video', 'null']);
+const CAN_REMAP = new Set(['shape', 'text', 'image', 'video', 'group', 'null']);
+
+/** "Group 1 › Shape" for layers inside groups. */
+function pathLabel(project: Project, layer: Layer) {
+  return [...ancestors(project, layer.id), layer].map((l) => l.name).join(' › ');
+}
+
+const closePanel = () => (useEditor.getState().sheet === 'props' ? openSheet(null) : select(null));
+
 export function Inspector() {
   const project = useEditor((s) => s.project);
   const selectedId = useEditor((s) => s.selectedId);
+  const selection = useEditor((s) => s.selection);
   if (!project) return null;
+  if (selection.length > 1) {
+    return (
+      <div className="inspector">
+        <MultiPanel project={project} ids={selection} />
+      </div>
+    );
+  }
   const layer = layerById(project, selectedId);
   return <div className="inspector">{layer ? <LayerPanel key={layer.id} project={project} layer={layer} /> : <ProjectPanel project={project} />}</div>;
+}
+
+/* ---------------- multi-selection ---------------- */
+
+function MultiPanel({ project, ids }: { project: Project; ids: string[] }) {
+  // Top to bottom, in tree order.
+  const layers = allLayers(project).filter((l) => ids.includes(l.id));
+  const saveElement = () => {
+    const name = window.prompt('Element name', layers[0]?.name ?? 'Element');
+    if (name !== null) void saveAsElement(name);
+  };
+  return (
+    <>
+      <div className="panel-head">
+        <Icon name="layers" />
+        <span className="multi-title">{ids.length} layers selected</span>
+        <IconButton icon="close" title="Close" onClick={closePanel} />
+      </div>
+      <div className="multi-actions">
+        <button type="button" className="btn" onClick={() => groupLayers()}>
+          <Icon name="group" size={16} /> Group
+        </button>
+        <button type="button" className="btn" onClick={() => duplicateLayers(selectedIds())}>
+          <Icon name="copy" size={16} /> Duplicate
+        </button>
+        <button type="button" className="btn" onClick={() => copyLayers()}>
+          <Icon name="paste" size={16} /> Copy
+        </button>
+        <button type="button" className="btn" onClick={saveElement}>
+          <Icon name="bookmark" size={16} /> Save as element
+        </button>
+        <button type="button" className="btn danger wide" onClick={() => deleteLayers(selectedIds())}>
+          <Icon name="trash" size={16} /> Delete
+        </button>
+      </div>
+      <Section title="Selected layers" id="multi-list">
+        <div className="multi-list">
+          {layers.map((l) => (
+            <button key={l.id} type="button" className="multi-item" title="Edit only this layer" onClick={() => select(l.id)}>
+              <span className="layer-dot" style={{ background: l.label }} />
+              <span className="ellipsis">{pathLabel(project, l)}</span>
+              <small>{l.type}</small>
+            </button>
+          ))}
+        </div>
+      </Section>
+    </>
+  );
 }
 
 /* ---------------- project ---------------- */
@@ -137,19 +228,28 @@ function ProjectPanel({ project }: { project: Project }) {
 function LayerPanel({ project, layer }: { project: Project; layer: Layer }) {
   const keySel = useEditor((s) => s.keySel);
   const sections = propSections(layer);
-  const idx = project.layers.indexOf(layer);
+  // Stacking order within the layer's own container (root or group).
+  const found = findLayer(project, layer.id);
+  const idx = found?.index ?? 0;
+  const count = found?.list.length ?? 1;
   return (
     <>
       <div className="panel-head">
         <span className="layer-dot" style={{ background: layer.label }} />
         <input className="name-input" value={layer.name} onChange={(e) => patchLayer(layer.id, { name: e.target.value }, `name:${layer.id}`)} />
         <IconButton icon="up" title="Bring forward (Ctrl+])" onClick={() => moveLayer(layer.id, idx - 1)} disabled={idx === 0} />
-        <IconButton icon="down" title="Send backward (Ctrl+[)" onClick={() => moveLayer(layer.id, idx + 1)} disabled={idx === project.layers.length - 1} />
+        <IconButton icon="down" title="Send backward (Ctrl+[)" onClick={() => moveLayer(layer.id, idx + 1)} disabled={idx === count - 1} />
         <IconButton icon="scissors" title="Split at playhead (S)" onClick={() => splitLayer(layer.id)} />
         <IconButton icon="copy" title="Duplicate (Ctrl+D)" onClick={() => duplicateLayer(layer.id)} />
         <IconButton icon="trash" title="Delete (Del)" onClick={() => deleteLayer(layer.id)} />
-        <IconButton icon="close" title="Close" onClick={() => (useEditor.getState().sheet === 'props' ? openSheet(null) : select(null))} />
+        <IconButton icon="close" title="Close" onClick={closePanel} />
       </div>
+      {found?.group && (
+        <button type="button" className="in-group" title="Select the group" onClick={() => select(found.group!.id)}>
+          <Icon name="group" size={14} />
+          <span className="ellipsis">In {pathLabel(project, found.group)}</span>
+        </button>
+      )}
       {keySel?.layerId === layer.id && <KeyframeSection project={project} layer={layer} />}
       <TypeSettings project={project} layer={layer} />
       {sections.map((s) => (
@@ -157,17 +257,23 @@ function LayerPanel({ project, layer }: { project: Project; layer: Layer }) {
           {s.defs.map((d) => (
             <PropRow key={d.key} project={project} layer={layer} path={d.key} def={d} />
           ))}
+          {s.title === 'Transform' && <AnchorTools project={project} layer={layer} />}
+          {s.title === 'Time remapping' && <p className="hint">Keyframe the layer's own time (seconds) to freeze, slow down, speed up or reverse it.</p>}
         </Section>
       ))}
-      {layer.type !== 'audio' && <EffectsSection project={project} layer={layer} />}
-      {layer.type !== 'audio' && layer.type !== 'adjustment' && <PresetsSection layer={layer} />}
+      {layer.type !== 'audio' && layer.type !== 'camera' && <EffectsSection project={project} layer={layer} />}
+      {layer.type !== 'audio' && layer.type !== 'adjustment' && layer.type !== 'camera' && <PresetsSection layer={layer} />}
       <TimingSection project={project} layer={layer} />
     </>
   );
 }
 
 function TimingSection({ project, layer }: { project: Project; layer: Layer }) {
-  const others = project.layers.filter((l) => l.id !== layer.id && l.type !== 'audio');
+  // A parent must be a sibling (same container).
+  const siblings = (findLayer(project, layer.id)?.list ?? []).filter((l) => l.id !== layer.id && l.type !== 'audio');
+  const mask = layer.maskMode ?? 'none';
+  // Cameras draw nothing: no blending or clipping.
+  const drawn = layer.type !== 'camera';
   return (
     <Section title="Timing & compositing" id="timing">
       <div className="row">
@@ -177,21 +283,53 @@ function TimingSection({ project, layer }: { project: Project; layer: Layer }) {
       </div>
       {layer.type !== 'audio' && (
         <>
-          <div className="row">
-            <span className="row-label">Blend</span>
-            <Select value={layer.blend} options={BLEND_MODES} onChange={(v) => patchLayer(layer.id, { blend: v })} />
-          </div>
-          <div className="row">
-            <span className="row-label" title="Only visible where the layer below is opaque">
-              Clip to below
-            </span>
-            <Toggle on={layer.clip} onChange={(v) => patchLayer(layer.id, { clip: v })} />
-          </div>
+          {drawn && (
+            <div className="row">
+              <span className="row-label">Blend</span>
+              <Select value={layer.blend} options={BLEND_MODES} onChange={(v) => patchLayer(layer.id, { blend: v })} />
+            </div>
+          )}
+          {CAN_MASK.has(layer.type) && (
+            <>
+              <div className="row">
+                <span className="row-label">Mask</span>
+                {/* 'none' is stored as no mask at all. */}
+                <Select<MaskMode> value={mask} options={MASK_MODES} onChange={(v) => patchLayer(layer.id, { maskMode: v === 'none' ? undefined : v })} />
+              </div>
+              <p className="hint opt-hint">Hides everything below it in the same group{mask !== 'none' ? '. The mask itself isn’t drawn; its opacity sets the strength.' : '.'}</p>
+            </>
+          )}
+          {drawn && (
+            <div className="row">
+              <span className="row-label" title="Only visible where the layer below is opaque">
+                Clip to below
+              </span>
+              <Toggle on={layer.clip} onChange={(v) => patchLayer(layer.id, { clip: v })} />
+            </div>
+          )}
+          {CAN_3D.has(layer.type) && (
+            <div className="row">
+              <span className="row-label" title="Adds Z position and X/Y rotation; seen through the camera">
+                3D layer
+              </span>
+              <Toggle on={!!layer.threeD} onChange={(v) => patchLayer(layer.id, { threeD: v })} />
+              {layer.threeD && <span className="row-value muted">Z, X/Y rotation in Transform</span>}
+            </div>
+          )}
+          {CAN_REMAP.has(layer.type) && (
+            <div className="row">
+              <span className="row-label" title="Keyframe the layer's own time">
+                Time remap
+              </span>
+              <Toggle on={!!layer.timeRemapOn} onChange={(v) => setTimeRemap(layer.id, v)} />
+              {layer.timeRemapOn && <span className="row-value muted">Keyframe it in Time remapping</span>}
+            </div>
+          )}
           <div className="row">
             <span className="row-label">Parent</span>
             <Select
               value={layer.parent ?? ''}
-              options={[{ value: '', label: 'None' }, ...others.map((l) => ({ value: l.id, label: l.name }))]}
+              options={[{ value: '', label: 'None' }, ...siblings.map((l) => ({ value: l.id, label: l.name }))]}
               onChange={(v) => setParent(layer.id, v || null)}
             />
           </div>
@@ -407,27 +545,115 @@ function TypeSettings({ project, layer }: { project: Project; layer: Layer }) {
       return <p className="hint pad">Effects on an adjustment layer apply to every layer below it. Lower its opacity to blend the result.</p>;
     case 'null':
       return <p className="hint pad">Nulls are invisible. Parent layers to this null to move, scale and rotate them together.</p>;
+    case 'group': {
+      const kids = layer.children ?? [];
+      return (
+        <Section title="Group" id="group-settings">
+          <div className="row">
+            <span className="row-label">Contents</span>
+            <span className="row-value">{kids.length === 1 ? '1 layer' : `${kids.length} layers`}</span>
+            <button type="button" className="btn small group-ungroup" onClick={() => ungroup(id)}>
+              <Icon name="ungroup" size={14} /> Ungroup
+            </button>
+          </div>
+          {kids.length > 0 && (
+            <div className="chips group-kids">
+              {kids.map((k) => (
+                <button key={k.id} type="button" className="chip" onClick={() => select(k.id)}>
+                  <span className="layer-dot" style={{ background: k.label }} />
+                  {k.name}
+                </button>
+              ))}
+            </div>
+          )}
+          <p className="hint">While the group is selected, tap a layer inside it on the canvas to edit that layer.</p>
+        </Section>
+      );
+    }
+    case 'camera':
+      return <CameraInfo project={project} layer={layer} />;
   }
 }
 
+function CameraInfo({ project, layer }: { project: Project; layer: Layer }) {
+  const time = useEditor((s) => s.time);
+  const has3D = allLayers(project).some((l) => l.threeD);
+  const inUse = activeCamera(project, time).layer;
+  return (
+    <div className="cam-info">
+      <p className="hint">3D layers are seen through the top-most visible camera. 2D layers stay flat on the screen.</p>
+      {inUse && inUse.id !== layer.id && <p className="hint">“{inUse.name}” is above this camera, so it is the one in use at the playhead.</p>}
+      {!inUse && <p className="hint">This camera isn’t active at the playhead (hidden or outside its In/Out).</p>}
+      {!has3D && <p className="hint cam-note">No 3D layers yet. Turn on “3D layer” in a layer’s Timing &amp; compositing section.</p>}
+    </div>
+  );
+}
+
 /* ---------------- properties ---------------- */
+
+/**
+ * Comp time of the previous / next keyframe of a property. Keys live on the
+ * property clock (groups, time remapping), so retimed layers are scanned
+ * frame by frame for the first frame that reaches a key.
+ */
+function keyJumpTime(project: Project, layer: Layer, path: string, keys: Keyframe[], time: number, dir: -1 | 1): number | null {
+  const fps = project.fps;
+  const eps = 0.5 / fps;
+  const localAt = (t: number) => propClock(project, layer, path, t) - layer.start;
+  if (!isRetimed(project, layer)) {
+    const local = localAt(time);
+    const k = dir < 0 ? [...keys].reverse().find((k) => k.t < local - eps) : keys.find((k) => k.t > local + eps);
+    return k ? time + (k.t - local) : null;
+  }
+  let prev = localAt(time);
+  const last = Math.round(project.duration * fps);
+  for (let n = Math.round(time * fps) + dir; n >= 0 && n <= last; n += dir) {
+    const cur = localAt(n / fps);
+    const lo = Math.min(prev, cur) - eps;
+    const hi = Math.max(prev, cur) + eps;
+    // A key reached between the previous frame and this one (not the one we start on).
+    if (keys.some((k) => k.t > lo && k.t < hi && Math.abs(k.t - prev) >= eps)) return n / fps;
+    prev = cur;
+  }
+  return null;
+}
 
 export function PropRow({ project, layer, path, def }: { project: Project; layer: Layer; path: string; def: PropDef }) {
   const time = useEditor((s) => s.time);
   const prop = getProp(layer, path);
   const animated = !!prop.keys?.length;
-  const value = evalPropAt(layer, path, time, ctxFor(project, layer));
-  const local = time - layer.start;
-  const keyHere = animated ? keyAt(prop, local, project.fps) : undefined;
+  // Keys and values live on the property clock (groups and time remapping), not raw comp time.
+  const clock = propClock(project, layer, path, time);
+  const value = evalPropAt(layer, path, clock, ctxFor(project, layer));
+  const keyHere = animated ? keyAt(prop, clock - layer.start, project.fps) : undefined;
   const [showExpr, setShowExpr] = useState(!!prop.expr);
+  const [menu, setMenu] = useState<DOMRect | null>(null);
   const change = (v: PropValue) => setPropValue(layer.id, path, v);
 
   const jump = (dir: -1 | 1) => {
-    const keys = prop.keys ?? [];
-    const eps = 0.5 / project.fps;
-    const k = dir < 0 ? [...keys].reverse().find((k) => k.t < local - eps) : keys.find((k) => k.t > local + eps);
-    if (k) setTime(layer.start + k.t);
+    const t = keyJumpTime(project, layer, path, prop.keys ?? [], time, dir);
+    if (t !== null) setTime(t);
   };
+
+  const exprItems: MenuItem[] =
+    def.kind === 'color'
+      ? []
+      : [
+          { icon: 'fx', label: prop.expr ? 'Edit expression' : 'Add expression', onSelect: () => setShowExpr(true) },
+          ...(prop.expr
+            ? [
+                {
+                  icon: 'close' as const,
+                  label: 'Remove expression',
+                  danger: true,
+                  onSelect: () => {
+                    setExpr(layer.id, path, undefined);
+                    setShowExpr(false);
+                  },
+                },
+              ]
+            : []),
+        ];
 
   return (
     <div className="prop">
@@ -440,9 +666,17 @@ export function PropRow({ project, layer, path, def }: { project: Project; layer
         >
           <Icon name="keyframe" size={12} />
         </button>
-        <span className="prop-label" title={def.label}>
-          {def.label}
-        </span>
+        <button
+          type="button"
+          className={`prop-label prop-label-btn ${menu ? 'open' : ''}`}
+          title={`${def.label}: copy, paste, reset…`}
+          aria-haspopup="menu"
+          aria-expanded={!!menu}
+          onClick={(e) => setMenu(e.currentTarget.getBoundingClientRect())}
+        >
+          <span>{def.label}</span>
+        </button>
+        {menu && <PropMenu layer={layer} path={path} def={def} anchor={menu} onClose={() => setMenu(null)} extra={exprItems} />}
         <div className="prop-editor">
           <ValueEditor def={def} value={value} onChange={change} />
         </div>
@@ -498,6 +732,50 @@ function ValueEditor({ def, value, onChange }: { def: PropDef; value: PropValue;
   );
 }
 
+/** Anchor presets as fractions of the layer's bounds, row by row. */
+const ANCHOR_SPOTS: { label: string; fx: number; fy: number }[] = [
+  { label: 'Top left', fx: 0, fy: 0 },
+  { label: 'Top', fx: 0.5, fy: 0 },
+  { label: 'Top right', fx: 1, fy: 0 },
+  { label: 'Left', fx: 0, fy: 0.5 },
+  { label: 'Center', fx: 0.5, fy: 0.5 },
+  { label: 'Right', fx: 1, fy: 0.5 },
+  { label: 'Bottom left', fx: 0, fy: 1 },
+  { label: 'Bottom', fx: 0.5, fy: 1 },
+  { label: 'Bottom right', fx: 1, fy: 1 },
+];
+
+/** Anchor (pivot) presets on the layer's bounds at the playhead, and the canvas anchor tool. */
+function AnchorTools({ project, layer }: { project: Project; layer: Layer }) {
+  const time = useEditor((s) => s.time);
+  const tool = useEditor((s) => s.tool);
+  const { ec, lt } = timesOf(project, layer, time);
+  const b = localBounds(layer, lt, ec, time);
+  const cur = vec(layer, 'anchor', propClock(project, layer, 'anchor', time), ec);
+  const tol = Math.max(0.5, Math.max(b.w, b.h) * 0.002);
+  return (
+    <div className="anchor-tools">
+      <div className="anchor-grid" role="group" aria-label="Anchor presets">
+        {ANCHOR_SPOTS.map((s) => {
+          const pt: Vec2 = [b.x + b.w * s.fx, b.y + b.h * s.fy];
+          const on = Math.abs(cur[0] - pt[0]) < tol && Math.abs(cur[1] - pt[1]) < tol;
+          return (
+            <button key={s.label} type="button" className={on ? 'on' : ''} title={`Anchor: ${s.label}`} aria-label={`Anchor: ${s.label}`} onClick={() => setAnchor(layer.id, pt)}>
+              <span />
+            </button>
+          );
+        })}
+      </div>
+      <div className="anchor-side">
+        <button type="button" className={`chip anchor-tool ${tool === 'anchor' ? 'on' : ''}`} aria-pressed={tool === 'anchor'} onClick={() => useEditor.setState({ tool: tool === 'anchor' ? 'select' : 'anchor' })}>
+          <Icon name="anchor" size={16} /> Anchor tool
+        </button>
+        <p className="hint">Move the pivot without moving the layer: tap a point, or drag it on the canvas with the anchor tool.</p>
+      </div>
+    </div>
+  );
+}
+
 const EXPR_EXAMPLES = ['wiggle(2, 30)', 'value + time * 90', 'value + [0, sin(time * 3) * 40]', 'loop()', 'random(0, 100)'];
 
 function ExprInput({ value, onChange }: { value: string; onChange: (expr: string | undefined) => void }) {
@@ -547,7 +825,18 @@ function ExprInput({ value, onChange }: { value: string; onChange: (expr: string
 
 function EffectsSection({ project, layer }: { project: Project; layer: Layer }) {
   const [picking, setPicking] = useState(false);
-  const others = project.layers.filter((l) => l.id !== layer.id && l.type !== 'audio');
+  const fxClip = useEditor((s) => s.fxClipboard);
+  const needsRefs = layer.effects.some((e) => EFFECT_DEFS[e.type]?.refs?.length);
+  // Effect references may point anywhere in the tree; nested layers show their group path.
+  const refOptions = useMemo(
+    () =>
+      needsRefs
+        ? allLayers(project)
+            .filter((l) => l.id !== layer.id && l.type !== 'audio' && l.type !== 'camera')
+            .map((l) => ({ value: l.id, label: pathLabel(project, l) }))
+        : [],
+    [needsRefs, project, layer.id],
+  );
   const adder = (
     <button type="button" className="btn small add-fx" onClick={() => setPicking(true)}>
       <Icon name="plus" size={14} /> Add effect
@@ -574,6 +863,7 @@ function EffectsSection({ project, layer }: { project: Project; layer: Layer }) 
               </span>
               <IconButton icon="up" size={14} title="Move up" disabled={i === 0} onClick={() => patchFx((l) => void l.effects.splice(i - 1, 0, l.effects.splice(i, 1)[0]))} />
               <IconButton icon="down" size={14} title="Move down" disabled={i === layer.effects.length - 1} onClick={() => patchFx((l) => void l.effects.splice(i + 1, 0, l.effects.splice(i, 1)[0]))} />
+              <IconButton icon="copy" size={14} title="Copy effect" onClick={() => copyEffects(layer.id, e.id)} />
               <IconButton icon="trash" size={14} title="Remove effect" onClick={() => patchFx((l) => void l.effects.splice(i, 1))} />
             </div>
             {def.refs?.map((r) => (
@@ -583,7 +873,7 @@ function EffectsSection({ project, layer }: { project: Project; layer: Layer }) 
                 </span>
                 <Select
                   value={e.refs?.[r.key] ?? ''}
-                  options={[{ value: '', label: r.hint?.includes('Default') ? 'Default' : 'None' }, ...others.map((l) => ({ value: l.id, label: l.name }))]}
+                  options={[{ value: '', label: r.hint?.includes('Default') ? 'Default' : 'None' }, ...refOptions]}
                   onChange={(v) =>
                     patchFx((l) => {
                       const fx = l.effects[i];
@@ -601,6 +891,16 @@ function EffectsSection({ project, layer }: { project: Project; layer: Layer }) 
           </div>
         );
       })}
+      {(layer.effects.length > 0 || !!fxClip?.length) && (
+        <div className="fx-clip">
+          <button type="button" className="btn small" disabled={!layer.effects.length} onClick={() => copyEffects(layer.id)}>
+            <Icon name="copy" size={14} /> Copy effects
+          </button>
+          <button type="button" className="btn small" disabled={!fxClip?.length} onClick={() => pasteEffects(layer.id)}>
+            <Icon name="paste" size={14} /> Paste effects{fxClip && fxClip.length > 1 ? ` (${fxClip.length})` : ''}
+          </button>
+        </div>
+      )}
       {picking && (
         <EffectPicker
           layer={layer}

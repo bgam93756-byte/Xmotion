@@ -1,0 +1,145 @@
+/* ---------------- viewport: anchor tool & view menu ---------------- */
+
+.viewport.anchor .viewport-wrap {
+  cursor: crosshair;
+}
+
+/* Narrow enough to clear the view button in the top-right corner. */
+.anchor-bar {
+  width: max-content;
+  max-width: calc(100% - 112px);
+  padding: 4px 6px 4px 12px;
+}
+
+.anchor-bar .anchor-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.anchor-bar .anchor-title svg {
+  color: #ffc94d;
+  flex: none;
+}
+
+.anchor-bar .btn {
+  min-height: 36px;
+}
+
+/* The button and popover are positioned against the viewport, so the popover can use its height. */
+.view-menu {
+  display: contents;
+}
+
+.view-btn {
+  position: absolute;
+  top: 10px;
+  right: calc(10px + var(--sar));
+  z-index: 6;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(20, 21, 27, 0.8);
+  backdrop-filter: blur(10px);
+  color: var(--text);
+}
+
+.view-btn.on {
+  color: var(--accent);
+}
+
+.view-btn.open {
+  border-color: var(--accent);
+}
+
+.view-pop {
+  position: absolute;
+  top: 52px;
+  right: calc(10px + var(--sar));
+  z-index: 7;
+  width: 236px;
+  max-width: calc(100% - 20px);
+  max-height: calc(100% - 62px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--panel3);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 4px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.view-pop .view-row {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 40px;
+  padding: 0 10px 0 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  text-align: left;
+}
+
+.view-pop .view-row:hover,
+.view-pop .view-act:hover:not(:disabled) {
+  background: var(--panel2);
+}
+
+.view-sub {
+  padding: 8px 12px 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.view-pop .view-seg {
+  margin: 0 8px 4px;
+  background: var(--panel2);
+}
+
+.view-pop .view-seg button {
+  min-height: 32px;
+  font-variant-numeric: tabular-nums;
+}
+
+.view-sep {
+  height: 1px;
+  margin: 6px 4px;
+  background: var(--line);
+}
+
+.view-pop .view-act {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 40px;
+  border: 0;
+  background: none;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  text-align: left;
+}
+
+.view-pop .view-act.danger {
+  color: var(--danger);
+}
+
+.view-pop .view-act:disabled {
+  opacity: 0.4;
+}
+
+.view-hint {
+  margin: 4px 12px 8px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--muted);
+}

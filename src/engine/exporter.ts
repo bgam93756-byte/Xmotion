@@ -27,8 +27,10 @@ import { media, sourceTime } from './media';
 import { allLayers } from '../model/tree';
 import { activeAt, mediaClock } from './transform';
 import { Renderer, free } from './renderer';
+import { ZIP_MAX_FILES, ZipLimitError, ZipWriter } from './zip';
 
-export type ExportFormat = 'mp4' | 'webm' | 'gif' | 'png';
+/** 'png-seq' / 'jpg-seq': every frame as an image file, in a .zip. */
+export type ExportFormat = 'mp4' | 'webm' | 'gif' | 'png' | 'png-seq' | 'jpg-seq';
 export type ExportQuality = 'low' | 'medium' | 'high' | 'max';
 
 export interface ExportOptions {
@@ -54,6 +56,16 @@ const QUALITY: Record<ExportQuality, Quality> = {
 export function supportsVideoExport() {
   return typeof VideoEncoder !== 'undefined';
 }
+
+export const isSequence = (format: ExportFormat) => format === 'png-seq' || format === 'jpg-seq';
+
+/** Number of frames rendered for a range at a frame rate. */
+export function frameCount({ from, to, fps }: Pick<ExportOptions, 'from' | 'to' | 'fps'>) {
+  return Math.max(1, Math.round((to - from) * fps));
+}
+
+/** One image file per frame, so a sequence can't have more frames than a ZIP holds files. */
+export const MAX_SEQUENCE_FRAMES = ZIP_MAX_FILES;
 
 const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
 
@@ -137,6 +149,10 @@ class VideoFrames {
   }
 }
 
+function encode(canvas: HTMLCanvasElement, type: 'image/png' | 'image/jpeg', quality?: number): Promise<Blob> {
+  return new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error(`${type === 'image/png' ? 'PNG' : 'JPEG'} failed`))), type, quality));
+}
+
 function seek(v: HTMLVideoElement, t: number): Promise<void> {
   return new Promise((res) => {
     if (Math.abs(v.currentTime - t) < 0.001 && v.readyState >= 2) return res();
@@ -157,6 +173,9 @@ function fontsOf(project: Project) {
 }
 
 export async function exportProject(project: Project, opts: ExportOptions, onProgress: Progress, signal: AbortSignal): Promise<{ blob: Blob; filename: string }> {
+  if (isSequence(opts.format) && frameCount(opts) > MAX_SEQUENCE_FRAMES) {
+    throw new Error(`An image sequence can have at most ${MAX_SEQUENCE_FRAMES.toLocaleString()} frames. Lower the frame rate or shorten the project.`);
+  }
   await waitForFonts(fontsOf(project));
   const renderer = new Renderer();
   const canvas = document.createElement('canvas');
@@ -168,18 +187,42 @@ export async function exportProject(project: Project, opts: ExportOptions, onPro
     await frames.prepare(opts.from);
     renderer.render(project, opts.from, canvas, { scale: opts.scale, transparent: opts.transparent, motionBlur: true });
     await frames.dispose();
-    const blob = await new Promise<Blob>((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error('PNG failed'))), 'image/png'));
+    const blob = await encode(canvas, 'image/png');
     renderer.dispose();
     free(canvas);
     return { blob, filename: `${name}.png` };
   }
 
   const fps = opts.fps;
-  const count = Math.max(1, Math.round((opts.to - opts.from) * fps));
+  const count = frameCount(opts);
   const times = Array.from({ length: count }, (_, i) => opts.from + i / fps);
   const frames = new VideoFrames(project, times);
   onProgress(0, 'Preparing media…');
   await frames.init();
+
+  if (isSequence(opts.format)) {
+    // Frames keep the exact output size (no even rounding); JPEG has no alpha, so only PNG can be transparent.
+    const png = opts.format === 'png-seq';
+    const zip = new ZipWriter();
+    try {
+      for (let i = 0; i < count; i++) {
+        if (signal.aborted) throw abortError();
+        await frames.prepare(times[i]);
+        renderer.render(project, times[i], canvas, { scale: opts.scale, transparent: png && opts.transparent, motionBlur: true });
+        const image = await encode(canvas, png ? 'image/png' : 'image/jpeg', png ? undefined : 0.92);
+        await zip.add(`${name}/${name}_${String(i + 1).padStart(5, '0')}.${png ? 'png' : 'jpg'}`, image);
+        onProgress((i + 1) / count, `Frame ${i + 1} / ${count}`);
+      }
+      return { blob: zip.finish(), filename: `${name}.zip` };
+    } catch (e) {
+      if (e instanceof ZipLimitError) throw new Error(`${e.message}. Try a smaller size, a lower frame rate${png ? ' or a JPEG sequence' : ''}.`);
+      throw e;
+    } finally {
+      await frames.dispose();
+      renderer.dispose();
+      free(canvas);
+    }
+  }
 
   // Render at an even size: H.264 requires it.
   const scale = opts.scale;

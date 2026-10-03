@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { exportProject, supportsVideoExport, type ExportFormat, type ExportQuality } from '../engine/exporter';
+import { MAX_SEQUENCE_FRAMES, exportProject, frameCount, isSequence, supportsVideoExport, type ExportFormat, type ExportQuality } from '../engine/exporter';
 import { stop, useEditor } from '../state/store';
 import { saveFile, isNative } from '../platform';
 import { Icon } from './icons';
@@ -10,6 +10,8 @@ const FORMATS: { value: ExportFormat; label: string; hint: string }[] = [
   { value: 'webm', label: 'WebM', hint: 'Smaller files, web' },
   { value: 'gif', label: 'GIF', hint: 'Loops, stickers' },
   { value: 'png', label: 'PNG', hint: 'Current frame' },
+  { value: 'png-seq', label: 'PNG sequence (.zip)', hint: 'Every frame as an image, for other editors' },
+  { value: 'jpg-seq', label: 'JPEG sequence (.zip)', hint: 'Every frame as an image, smaller files' },
 ];
 
 const QUALITIES: { value: ExportQuality; label: string }[] = [
@@ -35,6 +37,10 @@ export function ExportSheet() {
   const abort = useRef<AbortController | null>(null);
 
   const isVideo = format === 'mp4' || format === 'webm';
+  const seq = isSequence(format);
+  const canBeTransparent = format === 'png' || format === 'gif' || format === 'png-seq';
+  const frames = frameCount({ from: 0, to: project.duration, fps });
+  const tooMany = seq && frames > MAX_SEQUENCE_FRAMES;
   const gifScales = [240, 320, 480, 720].map((h) => h / shortSide).filter((s) => s <= 1);
   const scaleOpts = format === 'gif' ? gifScales : scales;
   const activeScale = scaleOpts.reduce((a, b) => (Math.abs(b - scale) < Math.abs(a - scale) ? b : a), scaleOpts[0] ?? 1);
@@ -54,7 +60,7 @@ export function ExportSheet() {
           quality,
           from: format === 'png' ? time : 0,
           to: project.duration,
-          transparent: (format === 'png' || format === 'gif') && transparent,
+          transparent: canBeTransparent && transparent,
         },
         (progress, label) => setPhase({ kind: 'running', progress, label }),
         abort.current.signal,
@@ -102,7 +108,7 @@ export function ExportSheet() {
         {isNative && <p className="hint">Also saved in Files › On My iPhone › Xmotion › Exports.</p>}
         <div className="row-btns">
           <button type="button" className="btn primary" onClick={() => void saveFile(phase.blob, phase.filename)}>
-            <Icon name="share" size={16} /> {isNative ? 'Share / Save to Photos' : 'Save again'}
+            <Icon name="share" size={16} /> {isNative ? (phase.filename.endsWith('.zip') ? 'Share / Save to Files' : 'Share / Save to Photos') : 'Save again'}
           </button>
           <button type="button" className="btn ghost" onClick={() => setPhase({ kind: 'idle' })}>
             Export another
@@ -112,8 +118,11 @@ export function ExportSheet() {
     );
   }
 
-  const W = Math.round((project.width * activeScale) / 2) * 2;
-  const H = Math.round((project.height * activeScale) / 2) * 2;
+  // Video and GIF frames are rounded to even sizes; images keep the exact size.
+  const size = (n: number) => (format === 'png' || seq ? Math.max(1, Math.round(n * activeScale)) : Math.round((n * activeScale) / 2) * 2);
+  const W = size(project.width);
+  const H = size(project.height);
+  const formatLabel = format === 'png-seq' ? 'PNG sequence' : format === 'jpg-seq' ? 'JPEG sequence' : format.toUpperCase();
 
   return (
     <div className="export">
@@ -144,6 +153,11 @@ export function ExportSheet() {
               </button>
             ))}
           </div>
+          {seq && (
+            <p className="hint">
+              {frames.toLocaleString()} frames · one {format === 'png-seq' ? 'PNG' : 'JPEG'} file per frame, numbered from 00001
+            </p>
+          )}
         </>
       )}
       {isVideo && (
@@ -158,16 +172,17 @@ export function ExportSheet() {
           </div>
         </>
       )}
-      {(format === 'png' || format === 'gif') && (
+      {canBeTransparent && (
         <div className="row">
           <span className="row-label">Transparent background</span>
           <Toggle on={transparent} onChange={setTransparent} />
         </div>
       )}
-      {isVideo && !supportsVideoExport() && <p className="warn">This device can’t encode video (needs iOS 16.4+ or a recent browser). GIF and PNG still work.</p>}
+      {isVideo && !supportsVideoExport() && <p className="warn">This device can’t encode video (needs iOS 16.4+ or a recent browser). GIF, PNG and image sequences still work.</p>}
+      {tooMany && <p className="warn">A ZIP can hold {MAX_SEQUENCE_FRAMES.toLocaleString()} frames at most. Lower the frame rate or shorten the project.</p>}
       {phase.kind === 'error' && <p className="warn">{phase.msg}</p>}
-      <button type="button" className="btn primary big" onClick={() => void run()} disabled={isVideo && !supportsVideoExport()}>
-        <Icon name="download" size={18} /> Export {format.toUpperCase()} · {W}×{H}
+      <button type="button" className="btn primary big" onClick={() => void run()} disabled={(isVideo && !supportsVideoExport()) || tooMany}>
+        <Icon name="download" size={18} /> Export {formatLabel} · {W}×{H}
       </button>
       <p className="hint center">Rendered frame-by-frame on your device: every effect, full quality, no watermark.</p>
     </div>

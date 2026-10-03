@@ -1,0 +1,511 @@
+/* ---------------- graph editor ---------------- */
+/* Fills .ed-timeline.graphing in place of the timeline. Rules carry .graph-editor so they
+   win over styles.css (loaded after this file). */
+
+.graph-editor {
+  /* Curve colors, validated as a set against the plot surface (contrast and color-blind separation). */
+  --ge-plot: #101118;
+  --ge-v: #9085e9;
+  --ge-x: #e66767;
+  --ge-y: #3987e5;
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  container-type: inline-size;
+}
+
+/* Header: title and tools on the first row, ease presets on the second (one row when wide). */
+.graph-editor .ge-head {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  padding: 4px calc(6px + var(--sar)) 4px calc(10px + var(--sal));
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.graph-editor .ge-title {
+  flex: 1 1 90px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.graph-editor .ge-layer {
+  flex: 0 1 auto;
+  min-width: 24px;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.graph-editor .ge-sep {
+  flex: none;
+  color: var(--muted);
+}
+
+.graph-editor .ge-propline {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.graph-editor .ge-prop {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 700;
+}
+
+.graph-editor .ge-badge {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  color: #c7b8ff;
+  background: rgba(124, 92, 255, 0.18);
+}
+
+.graph-editor .ge-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.graph-editor .ge-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-width: 36px;
+  height: 36px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel2);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.graph-editor .ge-btn.on {
+  color: #fff;
+  border-color: var(--accent);
+  background: rgba(124, 92, 255, 0.22);
+}
+
+.graph-editor .ge-close {
+  padding: 0;
+  border-color: transparent;
+  background: none;
+}
+
+/* Value / Speed */
+.graph-editor .ge-seg {
+  display: inline-flex;
+  height: 36px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel2);
+}
+
+.graph-editor .ge-seg button {
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  padding: 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.graph-editor .ge-seg button.on {
+  background: var(--panel3);
+  color: var(--text);
+}
+
+.graph-editor .ge-eases {
+  order: 1;
+  flex: 1 1 100%;
+  display: flex;
+  gap: 3px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.graph-editor .ge-eases::-webkit-scrollbar {
+  display: none;
+}
+
+.graph-editor .ge-ease {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel2);
+}
+
+.graph-editor .ge-ease svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.graph-editor .ge-ease.on {
+  border-color: var(--key);
+}
+
+.graph-editor .ge-ease.on svg {
+  stroke: var(--key);
+}
+
+/* No segment selected: the presets still answer (with a hint), they just look inactive. */
+.graph-editor .ge-eases.idle .ge-ease {
+  opacity: 0.45;
+}
+
+/* Phones: icon-only tools, and the layer name above the property so both stay readable. */
+@container (max-width: 520px) {
+  .graph-editor .ge-btn {
+    padding: 0;
+  }
+
+  .graph-editor .ge-btn span {
+    display: none;
+  }
+
+  .graph-editor .ge-title {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 1px;
+    line-height: 1.2;
+  }
+
+  .graph-editor .ge-layer {
+    max-width: none;
+    font-size: 11px;
+  }
+
+  .graph-editor .ge-sep {
+    display: none;
+  }
+}
+
+/* Wide panels: one row (title · ease presets · tools). */
+@container (min-width: 900px) {
+  .graph-editor .ge-eases {
+    flex: 0 1 auto;
+  }
+
+  .graph-editor .ge-tools {
+    order: 2;
+    margin-left: 6px;
+  }
+}
+
+/* ---------------- plot ---------------- */
+
+.graph-editor .ge-plot {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  margin: 0 var(--sar) 0 var(--sal);
+  overflow: hidden;
+}
+
+.graph-editor .ge-svg {
+  position: absolute;
+  inset: 0;
+  display: block;
+  touch-action: none;
+  cursor: grab;
+}
+
+.graph-editor .ge-svg:active {
+  cursor: grabbing;
+}
+
+.graph-editor .ge-svg [data-g='key'],
+.graph-editor .ge-svg [data-g='h'] {
+  cursor: move;
+}
+
+.graph-editor .ge-lane {
+  fill: var(--ge-plot);
+}
+
+.graph-editor .ge-shade {
+  fill: rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+}
+
+.graph-editor .ge-grid {
+  stroke: rgba(255, 255, 255, 0.05);
+  shape-rendering: crispEdges;
+  pointer-events: none;
+}
+
+.graph-editor .ge-grid.zero {
+  stroke: rgba(255, 255, 255, 0.14);
+}
+
+.graph-editor .ge-label,
+.graph-editor .ge-ltitle,
+.graph-editor .ge-legend text {
+  fill: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  paint-order: stroke;
+  stroke: var(--ge-plot);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.graph-editor .ge-ltitle {
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.graph-editor .ge-ltitle .ge-unit {
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.graph-editor .ge-legend {
+  pointer-events: none;
+}
+
+.graph-editor .ge-legend text {
+  fill: var(--text);
+  font-weight: 600;
+}
+
+.graph-editor .ge-curve {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.graph-editor .ge-glow {
+  fill: none;
+  stroke-width: 9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.22;
+  pointer-events: none;
+}
+
+.graph-editor .ge-curve.v,
+.graph-editor .ge-glow.v {
+  stroke: var(--ge-v);
+}
+
+.graph-editor .ge-curve.x,
+.graph-editor .ge-glow.x {
+  stroke: var(--ge-x);
+}
+
+.graph-editor .ge-curve.y,
+.graph-editor .ge-glow.y {
+  stroke: var(--ge-y);
+}
+
+.graph-editor .ge-curve.ease {
+  stroke: var(--key);
+  opacity: 0.6;
+}
+
+.graph-editor .ge-curve.ease.sel {
+  opacity: 1;
+  stroke-width: 2.5;
+}
+
+/* Ease of a segment whose keyframes hold the same value (it changes nothing yet). */
+.graph-editor .ge-curve.ghost {
+  opacity: 0.8;
+  stroke-width: 1.5;
+  stroke-dasharray: 4 4;
+}
+
+.graph-editor .ge-strip {
+  pointer-events: none;
+}
+
+.graph-editor .ge-hint {
+  fill: var(--muted);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.graph-editor .ge-arm {
+  stroke: rgba(255, 255, 255, 0.5);
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+
+.graph-editor .ge-end {
+  fill: var(--key);
+  pointer-events: none;
+}
+
+.graph-editor .ge-handle {
+  fill: #fff;
+  stroke: var(--accent);
+  stroke-width: 2.5;
+}
+
+/* Handles that only approximate the ease (back, elastic, bounce): dragging makes a custom curve. */
+.graph-editor .ge-hpair.approx .ge-arm {
+  stroke-dasharray: 3 3;
+}
+
+.graph-editor .ge-hpair.approx .ge-handle {
+  fill: var(--panel3);
+  stroke: var(--muted);
+}
+
+.graph-editor .ge-hit {
+  fill: transparent;
+}
+
+.graph-editor .ge-key {
+  fill: var(--key);
+  stroke: var(--ge-plot);
+  stroke-width: 2;
+}
+
+.graph-editor .ge-key.sel {
+  fill: #fff;
+  stroke: var(--accent);
+  stroke-width: 2.5;
+}
+
+.graph-editor .ge-swatch {
+  stroke: #fff;
+  stroke-width: 2;
+}
+
+.graph-editor .ge-swatch.sel {
+  stroke: var(--accent);
+  stroke-width: 3.5;
+}
+
+.graph-editor .ge-ruler-bg {
+  fill: var(--panel);
+}
+
+.graph-editor .ge-ruler-bg.scrub {
+  cursor: ew-resize;
+}
+
+.graph-editor .ge-ruler line,
+.graph-editor .ge-ruler text {
+  pointer-events: none;
+}
+
+.graph-editor .ge-tick {
+  stroke: rgba(255, 255, 255, 0.15);
+}
+
+.graph-editor .ge-tick.major {
+  stroke: rgba(255, 255, 255, 0.4);
+}
+
+.graph-editor .ge-tlabel {
+  fill: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.graph-editor .ge-playhead {
+  pointer-events: none;
+}
+
+.graph-editor .ge-playhead line {
+  stroke: #fff;
+  stroke-width: 1.5;
+}
+
+.graph-editor .ge-playhead path {
+  fill: #fff;
+}
+
+/* Selected keyframe (or the curve being shaped), at the right end of the ruler so it never covers the curves. */
+.graph-editor .ge-readout {
+  position: absolute;
+  top: 2px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 12px);
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel2);
+  box-shadow: -10px 0 10px var(--panel);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.graph-editor .ge-ro-ease {
+  color: var(--key);
+}
+
+.graph-editor .ge-sw {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+}
+
+.graph-editor .ge-empty {
+  flex: 1;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 6px;
+  padding: 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.graph-editor .ge-empty b {
+  color: var(--text);
+  font-size: 14px;
+}

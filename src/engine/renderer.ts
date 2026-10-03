@@ -5,7 +5,7 @@ import { applyEffects, hasPixelEffects, opacityFx, renderFx, shapeFx, textFx, ty
 import { media } from './media';
 import { buildShape, outlinePoints, type Rect } from './shapes';
 import { drawText, layoutText } from './text';
-import { corners, isActive, localBounds, outlineComp, shapeParams, timesOf, worldMatrix } from './transform';
+import { corners, isActive, isMaskLayer, localBounds, outlineComp, shapeParams, timesOf, worldMatrix } from './transform';
 import { activeCamera, depthAt, glMat3, homography, inv3, mul3, projectLocal, type Camera, type Mat3 } from './camera';
 import { glfx, LUMA_MATTE_FRAG, WARP_FRAG, type Common } from './gl';
 
@@ -133,7 +133,7 @@ function pixelMatrix(project: Project, layer: Layer, compT: number, s: number): 
 }
 
 export const is3DLayer = (l: Layer) => !!l.threeD && l.type !== 'group' && l.type !== 'camera';
-export const isMask = (l: Layer) => !!l.maskMode && l.maskMode !== 'none';
+export const isMask = isMaskLayer;
 const isDrawable = (l: Layer) => l.type !== 'audio' && l.type !== 'null' && l.type !== 'camera';
 
 /**

@@ -64,7 +64,13 @@ function index(root: Layer[]): Index {
 export function findLayer(project: Project, id: string | null | undefined): Found | null {
   if (!id) return null;
   if (isDraft(project.layers)) return findIn(project.layers, id, null);
-  return index(project.layers).byId.get(id) ?? null;
+  const hit = index(project.layers).byId.get(id);
+  if (hit && hit.list[hit.index] === hit.layer) return hit;
+  // The index is built per root array; arrays edited in place (outside the
+  // store's immutable updates) make it stale, so search and rebuild.
+  const found = findIn(project.layers, id, null);
+  if (found || hit) cache.delete(project.layers);
+  return found;
 }
 
 /** Every layer in the tree, depth first (parents before children). */

@@ -2,13 +2,13 @@ import { create } from 'zustand';
 import { produce, setAutoFreeze } from 'immer';
 import type { AssetMeta, Bezier, EaseName, Effect, Keyframe, Layer, Project, Prop, PropValue, Vec2 } from '../model/types';
 import { evalPropAt, keyAt, sortKeys, vec, type EvalContext } from '../model/animate';
-import { cloneValue, createEffect, createLayer, findDef, getProp, propOwner, type PropKind } from '../model/schema';
+import { cloneValue, createEffect, createLayer, defaultZoom, findDef, getProp, propOwner, type PropKind } from '../model/schema';
 import { allLayers, findLayer, isInside, walk } from '../model/tree';
 import { uid } from '../model/ids';
 import { audioPlayer } from '../engine/audio';
 import { media } from '../engine/media';
 import { getAsset } from '../engine/storage';
-import { corners, ctxFor, localBounds, localMatrix, parentMatrix, propClock, timesOf, worldMatrix } from '../engine/transform';
+import { corners, ctxFor, isMaskLayer, localBounds, localMatrix, parentMatrix, propClock, timesOf, worldMatrix } from '../engine/transform';
 
 setAutoFreeze(false);
 
@@ -535,7 +535,7 @@ export function ungroup(id: string) {
   if (!p || !f || f.layer.type !== 'group') return;
   const g = f.layer;
   const kids = g.children ?? [];
-  if (g.effects.length || g.timeRemapOn || getProp(g, 'opacity').keys?.length || (getProp(g, 'opacity').value as number) < 100 || g.maskMode)
+  if (g.effects.length || g.timeRemapOn || getProp(g, 'opacity').keys?.length || (getProp(g, 'opacity').value as number) < 100 || isMaskLayer(g))
     toast("The group's opacity, effects, mask and time remapping were removed");
   const snap = snapshot(
     p,
@@ -708,12 +708,24 @@ export function pasteProp(layerId: string, path: string) {
   });
 }
 
+/** Resets a property; position goes back to the comp center (as new layers start). */
 export function resetProp(layerId: string, path: string) {
+  const { project, time } = get();
+  const layer = project && layerById(project, layerId);
+  if (!project || !layer) return;
+  let value: PropValue | undefined;
+  if (path === 'position') {
+    const inv = parentMatrix(project, layer, time).inverse();
+    const c = Number.isNaN(inv.a) ? new DOMPoint(project.width / 2, project.height / 2) : inv.transformPoint(new DOMPoint(project.width / 2, project.height / 2));
+    value = [round2(c.x), round2(c.y)];
+  } else if (layer.type === 'camera' && (path === 'z' || path === 'zoom')) {
+    value = path === 'z' ? -defaultZoom(project) : defaultZoom(project);
+  }
   update((p) => {
     const l = layerById(p, layerId);
     const def = l && findDef(l, path);
     const o = l && propOwner(l, path);
-    if (def && o) o.owner[o.key] = { value: cloneValue(def.def) };
+    if (def && o) o.owner[o.key] = { value: cloneValue(value ?? def.def) };
   });
 }
 

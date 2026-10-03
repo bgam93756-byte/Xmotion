@@ -1,27 +1,208 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Layer, Project, Vec2 } from '../model/types';
-import { evalPropAt, keyedValue } from '../model/animate';
+import { evalPropAt, keyedValue, num, vec } from '../model/animate';
 import { getProp } from '../model/schema';
-import { Renderer } from '../engine/renderer';
+import { allLayers, findLayer, isInside } from '../model/tree';
+import { flat, is3DLayer, isMask, Renderer } from '../engine/renderer';
 import { media } from '../engine/media';
 import { onFontsChanged } from '../engine/fonts';
-import { simplify } from '../engine/shapes';
-import { apply, corners, ctxFor, hitTest, isActive, localBounds, parentMatrix, worldMatrix } from '../engine/transform';
-import { endMerge, layerById, openSheet, select, setPropValue, useEditor } from '../state/store';
+import { simplify, type Rect } from '../engine/shapes';
+import { activeAt, apply, corners, hitTest, localBounds, parentMatrix, propClock, timesOf, worldMatrix } from '../engine/transform';
+import { activeCamera, homography, projectLocal, projectPoint, rayToLayer, screenDeltaToWorld, type Camera } from '../engine/camera';
+import {
+  endMerge,
+  layerById,
+  openSheet,
+  select,
+  selectedIds,
+  setAnchor,
+  setPropValue,
+  toggleSelect,
+  update,
+  useEditor,
+  writeValue,
+  type EditorState,
+  type ViewSettings,
+} from '../state/store';
 import { addDrawing } from './actions';
 import { haptic, isTouch } from '../platform';
 import { Icon } from './icons';
+import { ViewMenu } from './ViewMenu';
+import { boxOf, moveBox, snapBox, snapTargets, snapValue, unionBox, type Box, type SnapTargets } from './snap';
+import './viewport.css';
+
+/** One layer being moved, and how a comp-space drag maps into its parent's space. */
+interface MoveItem {
+  id: string;
+  v0: Vec2;
+  /** Inverse of the parent space: its 2D part for 2D layers, the full matrix for 3D layers. */
+  inv: DOMMatrix;
+  /** 3D layers move on the plane facing the camera through their anchor (world point `at`). */
+  z0?: number;
+  at?: [number, number, number];
+}
 
 type Drag =
-  | { kind: 'move'; layer: string; p0: Vec2; v0: Vec2; inv: DOMMatrix; gid: number; snapped: [boolean, boolean] }
+  | { kind: 'move'; hit: string; items: MoveItem[]; p0: Vec2; s0: Vec2; gid: number; moved: boolean; cam: Camera | null; box: Box | null; targets: SnapTargets | null; snapped: [boolean, boolean] }
   | { kind: 'scale'; layer: string; s0: Vec2; h0: Vec2; base: DOMMatrix; gid: number }
   | { kind: 'rotate'; layer: string; r0: number; a0: number; center: Vec2; gid: number }
+  | { kind: 'anchor'; layer: string; off: Vec2; snap: number }
+  | { kind: 'guide'; axis: 'v' | 'h'; index: number; value: number; pt: Vec2; gid: number }
   | { kind: 'pan'; s0: Vec2; pan0: Vec2 }
   | { kind: 'pen'; points: Vec2[] }
   | { kind: 'pinch'; d0: number; mid0: Vec2; zoom0: number; pan0: Vec2 };
 
 let gestureId = 0;
 const HANDLE = isTouch ? 22 : 10;
+/** Snap distances in screen pixels. */
+const SNAP_PX = 8;
+const ANCHOR_SNAP_PX = isTouch ? 14 : 10;
+const GUIDE_PX = isTouch ? 12 : 8;
+/** Pointer travel before a press on a layer starts moving it (keeps taps from nudging). */
+const MOVE_SLOP = isTouch ? 4 : 2;
+const ACCENT = '#7c5cff';
+const ANCHOR = '#ffc94d';
+const GUIDE = '#35c8ff';
+const SNAP = '#ff5c8a';
+
+const round1 = (v: number) => Math.round(v * 10) / 10;
+const dist = (a: Vec2, b: Vec2) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+/** Layers whose transform can be edited in the viewport. */
+const canEdit = (l: Layer) => !l.locked && l.type !== 'audio' && l.type !== 'camera';
+
+/* ---------------- geometry (comp space) ---------------- */
+
+/** Resolves the active camera at most once per frame or gesture. */
+function lazyCamera(p: Project, t: number): () => Camera {
+  let cam: Camera | null = null;
+  return () => (cam ??= activeCamera(p, t));
+}
+
+function boundsOf(p: Project, l: Layer, t: number): Rect {
+  const { ec, lt } = timesOf(p, l, t);
+  return localBounds(l, lt, ec, t);
+}
+
+function anchorOf(p: Project, l: Layer, t: number): Vec2 {
+  const { ec, lt } = timesOf(p, l, t);
+  return vec(l, 'anchor', lt, ec);
+}
+
+/**
+ * Local points → comp space: projected through the camera for 3D layers, else
+ * with the 2D part of the world matrix. Null when a point is behind the camera.
+ */
+function toCompSpace(p: Project, l: Layer, t: number, pts: Vec2[], cam: () => Camera): Vec2[] | null {
+  const w = worldMatrix(p, l, t);
+  if (is3DLayer(l)) {
+    const H = homography(cam(), w);
+    const out = pts.map(([u, v]) => projectLocal(H, u, v));
+    return out.every(Boolean) ? (out as Vec2[]) : null;
+  }
+  const m = flat(w);
+  return pts.map((q) => apply(m, q));
+}
+
+/** A layer's content corners in comp space. */
+function compCorners(p: Project, l: Layer, t: number, cam: () => Camera): Vec2[] | null {
+  return toCompSpace(p, l, t, corners(boundsOf(p, l, t)), cam);
+}
+
+/** Corners, edge centers and center of a rect (anchor snap points). */
+function ninePoints(b: Rect): Vec2[] {
+  const xs = [b.x, b.x + b.w / 2, b.x + b.w];
+  const ys = [b.y, b.y + b.h / 2, b.y + b.h];
+  return ys.flatMap((y) => xs.map((x): Vec2 => [x, y]));
+}
+
+function insidePoly(pts: Vec2[], [x, y]: Vec2): boolean {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const [xi, yi] = pts[i];
+    const [xj, yj] = pts[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+/** True when a moving layer is up the layer's parent chain (so it moves along). */
+function follows(p: Project, l: Layer, moving: Set<string>): boolean {
+  let cur = l.parent;
+  for (let n = 0; cur && n < 64; n++) {
+    if (moving.has(cur)) return true;
+    cur = layerById(p, cur)?.parent;
+  }
+  return false;
+}
+
+/**
+ * The layer the select tool grabs at a comp point: a selected mask (masks
+ * aren't hit-tested) or a selected group keeps the pointer, so it can be
+ * dragged as a whole; otherwise the top-most layer, groups picked whole.
+ */
+function pick(p: Project, c: Vec2, t: number, selectedId: string | null): Layer | null {
+  const sel = layerById(p, selectedId);
+  if (sel && isMask(sel) && canEdit(sel) && activeAt(p, sel, t)) {
+    const cs = compCorners(p, sel, t, lazyCamera(p, t));
+    if (cs && insidePoly(cs, c)) return sel;
+  }
+  const hit = hitTest(p, c, t, selectedId);
+  if (hit && sel?.type === 'group' && hit.id !== sel.id && isInside(p, hit.id, sel.id)) return sel;
+  return hit;
+}
+
+/** Boxes of other visible layers to snap to: top-level layers and the moving layers' siblings. */
+function snapBoxes(p: Project, t: number, moving: Set<string>, cam: () => Camera): Box[] {
+  const pool = new Set<Layer>(p.layers);
+  for (const id of moving) {
+    const f = findLayer(p, id);
+    if (f?.group) f.list.forEach((l) => pool.add(l));
+  }
+  const out: Box[] = [];
+  for (const l of pool) {
+    if (moving.has(l.id) || l.type === 'audio' || l.type === 'adjustment' || l.type === 'camera' || l.type === 'null' || isMask(l)) continue;
+    if (!activeAt(p, l, t) || follows(p, l, moving) || [...moving].some((id) => isInside(p, id, l.id))) continue;
+    const b = boxOf(compCorners(p, l, t, cam) ?? []);
+    if (b) out.push(b);
+  }
+  return out;
+}
+
+/** Starts moving layers (several when dragging a multi-selection). */
+function startMove(p: Project, t: number, ids: string[], hit: string, pt: Vec2, c: Vec2, gid: number): Drag | null {
+  const moving = new Set(ids);
+  const cam = lazyCamera(p, t);
+  const items: MoveItem[] = [];
+  let box: Box | null = null;
+  let has3D = false;
+  for (const id of ids) {
+    const l = layerById(p, id);
+    if (!l || !canEdit(l)) continue;
+    // Layers inside a moving group, or parented to a moving layer, already move with it.
+    if (ids.some((o) => o !== id && isInside(p, id, o)) || follows(p, l, moving)) continue;
+    const { ec, lt } = timesOf(p, l, t);
+    const v0 = evalPropAt(l, 'position', propClock(p, l, 'position', t), ec) as Vec2;
+    const pm = parentMatrix(p, l, t);
+    if (is3DLayer(l)) {
+      has3D = true;
+      const [ax, ay] = vec(l, 'anchor', lt, ec);
+      const w = worldMatrix(p, l, t).transformPoint(new DOMPoint(ax, ay, 0));
+      const z0 = evalPropAt(l, 'z', propClock(p, l, 'z', t), ec) as number;
+      items.push({ id, v0, inv: pm.inverse(), z0, at: [w.x, w.y, w.z] });
+    } else {
+      items.push({ id, v0, inv: flat(pm).inverse() });
+      box = unionBox(box, boxOf(compCorners(p, l, t, cam) ?? []));
+    }
+  }
+  if (!items.length) return null;
+  // Box snapping is for 2D moves; 3D layers move in perspective.
+  const vs = useEditor.getState().view;
+  const targets =
+    !has3D && box && vs.snap
+      ? snapTargets({ width: p.width, height: p.height, guides: vs.guides ? p.guides : null, grid: vs.grid ? vs.gridSize : null, boxes: snapBoxes(p, t, moving, cam) })
+      : null;
+  return { kind: 'move', hit, items, p0: c, s0: pt, gid, moved: false, cam: has3D ? cam() : null, box: has3D ? null : box, targets, snapped: [false, false] };
+}
 
 export function Viewport() {
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -32,16 +213,25 @@ export function Viewport() {
   const [zoomLabel, setZoomLabel] = useState(30);
   const drag = useRef<Drag | null>(null);
   const pointers = useRef(new Map<number, Vec2>());
-  const guides = useRef<{ x?: number; y?: number }>({});
+  /** Magenta lines shown while a move is snapped (comp px). */
+  const snapLines = useRef<{ x: number[]; y: number[] } | null>(null);
+  /** Press of the current single-pointer gesture, and the last tap (double-tap detection). */
+  const down = useRef<{ pt: Vec2; at: number } | null>(null);
+  const lastTap = useRef<{ pt: Vec2; at: number } | null>(null);
   const raf = useRef(0);
+  const fullDraw = useRef(true);
   const tool = useEditor((s) => s.tool);
   const brush = useEditor((s) => s.brush);
 
-  const schedule = () => {
+  /** Redraws on the next frame; overlay-only skips rendering the comp. */
+  const schedule = (overlayOnly = false) => {
+    if (!overlayOnly) fullDraw.current = true;
     if (raf.current) return;
     raf.current = requestAnimationFrame(() => {
       raf.current = 0;
-      draw();
+      const full = fullDraw.current;
+      fullDraw.current = false;
+      draw(full);
     });
   };
 
@@ -78,32 +268,35 @@ export function Viewport() {
     return [x * v.zoom + v.pan[0], y * v.zoom + v.pan[1]];
   };
 
-  function draw() {
+  function draw(full: boolean) {
     const s = useEditor.getState();
     const p = s.project;
     const canvas = canvasRef.current;
     const wrap = wrapRef.current;
     if (!p || !canvas || !wrap) return;
-    const dpr = window.devicePixelRatio || 1;
-    const v = view.current;
-    const q = s.previewQuality;
-    const shown = p.width * v.zoom * dpr;
-    let scale = q === 'full' ? 1 : q === 'half' ? 0.5 : q === 'quarter' ? 0.25 : Math.min(1, shown / p.width);
-    // Keep playback smooth on phones: cap the preview at ~1.5M pixels while playing.
-    if (s.playing && q === 'auto') scale = Math.min(scale, Math.sqrt(1.5e6 / (p.width * p.height)));
-    scale = Math.max(0.05, scale);
-    media.syncVideos(p, s.time, s.playing);
-    renderer.current.render(p, s.time, canvas, { scale, motionBlur: !s.playing });
-    canvas.style.width = `${p.width * v.zoom}px`;
-    canvas.style.height = `${p.height * v.zoom}px`;
-    canvas.style.transform = `translate(${v.pan[0]}px, ${v.pan[1]}px)`;
-    drawOverlay(p, s.time, s.selectedId);
+    if (full) {
+      const dpr = window.devicePixelRatio || 1;
+      const v = view.current;
+      const q = s.previewQuality;
+      const shown = p.width * v.zoom * dpr;
+      let scale = q === 'full' ? 1 : q === 'half' ? 0.5 : q === 'quarter' ? 0.25 : Math.min(1, shown / p.width);
+      // Keep playback smooth on phones: cap the preview at ~1.5M pixels while playing.
+      if (s.playing && q === 'auto') scale = Math.min(scale, Math.sqrt(1.5e6 / (p.width * p.height)));
+      scale = Math.max(0.05, scale);
+      media.syncVideos(p, s.time, s.playing);
+      renderer.current.render(p, s.time, canvas, { scale, motionBlur: !s.playing });
+      canvas.style.width = `${p.width * v.zoom}px`;
+      canvas.style.height = `${p.height * v.zoom}px`;
+      canvas.style.transform = `translate(${v.pan[0]}px, ${v.pan[1]}px)`;
+    }
+    drawOverlay(s, p);
   }
 
-  function drawOverlay(p: Project, t: number, selectedId: string | null) {
+  function drawOverlay(s: EditorState, p: Project) {
     const o = overlayRef.current;
     const wrap = wrapRef.current;
     if (!o || !wrap) return;
+    const t = s.time;
     const dpr = window.devicePixelRatio || 1;
     const W = wrap.clientWidth;
     const H = wrap.clientHeight;
@@ -121,39 +314,43 @@ export function Viewport() {
     ctx.strokeStyle = 'rgba(255,255,255,0.12)';
     ctx.lineWidth = 1;
     ctx.strokeRect(x0 - 0.5, y0 - 0.5, x1 - x0 + 1, y1 - y0 + 1);
+    const cam = lazyCamera(p, t);
+
+    drawAids(ctx, p, s.view, W, H);
 
     // Null layers are invisible in the render; show them as handles.
-    for (const l of p.layers) {
-      if (l.type !== 'null' || !l.visible || !isActive(l, t)) continue;
-      const m = worldMatrix(p, l, t);
-      const c = toScreen(apply(m, [0, 0]));
+    for (const l of allLayers(p)) {
+      if (l.type !== 'null' || !activeAt(p, l, t)) continue;
+      const c = toCompSpace(p, l, t, [[0, 0]], cam);
+      if (!c) continue;
+      const [sx, sy] = toScreen(c[0]);
       ctx.strokeStyle = 'rgba(160,170,190,0.8)';
       ctx.setLineDash([4, 3]);
-      ctx.strokeRect(c[0] - 14, c[1] - 14, 28, 28);
+      ctx.strokeRect(sx - 14, sy - 14, 28, 28);
       ctx.setLineDash([]);
     }
 
-    const g = guides.current;
-    ctx.strokeStyle = '#ff5c8a';
-    ctx.lineWidth = 1;
-    if (g.x !== undefined) {
-      const sx = toScreen([g.x, 0])[0];
+    const sl = snapLines.current;
+    if (sl) {
+      ctx.strokeStyle = SNAP;
+      ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(sx, y0);
-      ctx.lineTo(sx, y1);
-      ctx.stroke();
-    }
-    if (g.y !== undefined) {
-      const sy = toScreen([0, g.y])[1];
-      ctx.beginPath();
-      ctx.moveTo(x0, sy);
-      ctx.lineTo(x1, sy);
+      for (const x of sl.x) {
+        const sx = toScreen([x, 0])[0];
+        ctx.moveTo(sx, y0);
+        ctx.lineTo(sx, y1);
+      }
+      for (const y of sl.y) {
+        const sy = toScreen([0, y])[1];
+        ctx.moveTo(x0, sy);
+        ctx.lineTo(x1, sy);
+      }
       ctx.stroke();
     }
 
     const d = drag.current;
     if (d?.kind === 'pen' && d.points.length > 1) {
-      const b = useEditor.getState().brush;
+      const b = s.brush;
       ctx.strokeStyle = b.color;
       ctx.lineWidth = b.width * view.current.zoom;
       ctx.lineCap = 'round';
@@ -167,56 +364,216 @@ export function Viewport() {
       ctx.stroke();
     }
 
-    const layer = layerById(p, selectedId);
-    if (!layer || !layer.visible || layer.type === 'audio' || !isActive(layer, t)) return;
-    drawMotionPath(ctx, p, layer, t);
-    if (layer.type === 'adjustment') return;
-    const m = worldMatrix(p, layer, t);
-    const b = localBounds(layer, t, ctxFor(p, layer));
-    const pts = corners(b).map((c) => toScreen(apply(m, c)));
-    ctx.strokeStyle = '#7c5cff';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
-    ctx.closePath();
-    ctx.stroke();
-    if (layer.locked) return;
-    // Rotation handle
-    const top: Vec2 = [(pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2];
-    const rh = rotateHandle(pts);
-    ctx.beginPath();
-    ctx.moveTo(top[0], top[1]);
-    ctx.lineTo(rh[0], rh[1]);
-    ctx.stroke();
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.arc(rh[0], rh[1], isTouch ? 8 : 5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-    // Scale handles
-    for (const [x, y] of pts) {
-      const r = isTouch ? 7 : 4.5;
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(x - r, y - r, r * 2, r * 2);
-      ctx.strokeRect(x - r, y - r, r * 2, r * 2);
-    }
-    // Anchor point
-    const anchor = evalPropAt(layer, 'anchor', t, ctxFor(p, layer)) as Vec2;
-    const [ax, ay] = toScreen(apply(m, anchor));
-    ctx.strokeStyle = '#ffc94d';
-    ctx.beginPath();
-    ctx.arc(ax, ay, 5, 0, Math.PI * 2);
-    ctx.moveTo(ax - 9, ay);
-    ctx.lineTo(ax + 9, ay);
-    ctx.moveTo(ax, ay - 9);
-    ctx.lineTo(ax, ay + 9);
-    ctx.stroke();
+    drawSelection(ctx, s, p, cam);
   }
 
-  function drawMotionPath(ctx: CanvasRenderingContext2D, p: Project, layer: Layer, t: number) {
+  /** Grid, rule of thirds, safe areas and guides. */
+  function drawAids(ctx: CanvasRenderingContext2D, p: Project, vs: ViewSettings, W: number, H: number) {
+    const [x0, y0] = toScreen([0, 0]);
+    const [x1, y1] = toScreen([p.width, p.height]);
+    const vline = (x: number, a: number, b: number) => {
+      const sx = Math.round(x) + 0.5;
+      ctx.moveTo(sx, a);
+      ctx.lineTo(sx, b);
+    };
+    const hline = (y: number, a: number, b: number) => {
+      const sy = Math.round(y) + 0.5;
+      ctx.moveTo(a, sy);
+      ctx.lineTo(b, sy);
+    };
+    // Light lines with a dark halo so they read on any content.
+    const contrast = (color: string) => {
+      ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    };
+    ctx.save();
+    if (vs.grid && vs.gridSize > 0) {
+      let step = vs.gridSize;
+      while (step * view.current.zoom < 6) step *= 2;
+      ctx.beginPath();
+      for (let x = step; x < p.width - 1e-6; x += step) vline(toScreen([x, 0])[0], y0, y1);
+      for (let y = step; y < p.height - 1e-6; y += step) hline(toScreen([0, y])[1], x0, x1);
+      ctx.strokeStyle = 'rgba(170,176,196,0.3)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    if (vs.thirds) {
+      ctx.beginPath();
+      for (const k of [1 / 3, 2 / 3]) {
+        vline(x0 + (x1 - x0) * k, y0, y1);
+        hline(y0 + (y1 - y0) * k, x0, x1);
+      }
+      contrast('rgba(255,255,255,0.55)');
+    }
+    if (vs.safe) {
+      // Action safe (90%) and title safe (80%).
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      for (const k of [0.9, 0.8]) {
+        const mx = ((1 - k) / 2) * (x1 - x0);
+        const my = ((1 - k) / 2) * (y1 - y0);
+        ctx.rect(Math.round(x0 + mx) + 0.5, Math.round(y0 + my) + 0.5, Math.round((x1 - x0) * k), Math.round((y1 - y0) * k));
+      }
+      contrast('rgba(255,255,255,0.5)');
+      ctx.setLineDash([]);
+    }
+    const g = p.guides;
+    if (vs.guides && g) {
+      const d = drag.current;
+      const dragging = (axis: 'v' | 'h', i: number) => d?.kind === 'guide' && d.axis === axis && d.index === i;
+      const off = (axis: 'v' | 'h', v: number) => v < 0 || v > (axis === 'v' ? p.width : p.height);
+      ctx.lineWidth = 1;
+      const line = (axis: 'v' | 'h', v: number, i: number) => {
+        const gone = dragging(axis, i) && off(axis, v);
+        ctx.strokeStyle = gone ? 'rgba(255,92,108,0.9)' : GUIDE;
+        ctx.setLineDash(gone ? [6, 4] : []);
+        ctx.beginPath();
+        if (axis === 'v') vline(toScreen([v, 0])[0], 0, H);
+        else hline(toScreen([0, v])[1], 0, W);
+        ctx.stroke();
+      };
+      g.v.forEach((x, i) => line('v', x, i));
+      g.h.forEach((y, i) => line('h', y, i));
+      ctx.setLineDash([]);
+      if (d?.kind === 'guide') label(ctx, off(d.axis, d.value) ? 'Remove' : `${d.axis === 'v' ? 'x' : 'y'} ${d.value}`, d.pt[0] + 14, d.pt[1] - 18);
+    }
+    ctx.restore();
+  }
+
+  function label(ctx: CanvasRenderingContext2D, text: string, x: number, y: number) {
+    ctx.save();
+    ctx.font = '600 11px -apple-system, system-ui, sans-serif';
+    const w = ctx.measureText(text).width + 12;
+    ctx.fillStyle = 'rgba(20,21,27,0.9)';
+    ctx.beginPath();
+    ctx.roundRect(x, y - 10, w, 20, 6);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, x + 6, y);
+    ctx.restore();
+  }
+
+  function outline(ctx: CanvasRenderingContext2D, cs: Vec2[] | null, color: string, dashed = false) {
+    if (!cs) return;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    if (dashed) ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    cs.map(toScreen).forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function crosshair(ctx: CanvasRenderingContext2D, [x, y]: Vec2, big = false) {
+    const r = big ? 8 : 5;
+    const arm = big ? 16 : 9;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.moveTo(x - arm, y);
+    ctx.lineTo(x + arm, y);
+    ctx.moveTo(x, y - arm);
+    ctx.lineTo(x, y + arm);
+    if (big) {
+      ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+      ctx.lineWidth = 4;
+      ctx.stroke();
+    }
+    ctx.strokeStyle = ANCHOR;
+    ctx.lineWidth = big ? 2 : 1.5;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawSelection(ctx: CanvasRenderingContext2D, s: EditorState, p: Project, cam: () => Camera) {
+    const t = s.time;
+    const primary = layerById(p, s.selectedId);
+    const ids = s.selection.length ? s.selection : primary ? [primary.id] : [];
+    const multi = ids.length > 1;
+    // The group the selection lives in, as a faint frame.
+    const group = primary && findLayer(p, primary.id)?.group;
+    if (group && activeAt(p, group, t)) outline(ctx, compCorners(p, group, t, cam), 'rgba(124,92,255,0.65)', true);
+    for (const id of ids) {
+      const l = layerById(p, id);
+      if (!l || l.type === 'audio' || l.type === 'camera' || l.type === 'adjustment' || !activeAt(p, l, t)) continue;
+      outline(ctx, compCorners(p, l, t, cam), ACCENT, isMask(l));
+    }
+    if (!primary || primary.type === 'audio' || primary.type === 'camera' || !activeAt(p, primary, t)) return;
+    drawMotionPath(ctx, p, primary, t, cam);
+    if (s.tool === 'anchor') return drawAnchorTool(ctx, p, primary, t, cam);
+    if (primary.type === 'adjustment' || multi || primary.locked) return;
+    const cs = compCorners(p, primary, t, cam);
+    if (!cs) return;
+    ctx.strokeStyle = ACCENT;
+    ctx.lineWidth = 1.5;
+    if (!is3DLayer(primary)) {
+      const pts = cs.map(toScreen);
+      // Rotation handle
+      const top: Vec2 = [(pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2];
+      const rh = rotateHandle(pts);
+      ctx.beginPath();
+      ctx.moveTo(top[0], top[1]);
+      ctx.lineTo(rh[0], rh[1]);
+      ctx.stroke();
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.arc(rh[0], rh[1], isTouch ? 8 : 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      // Scale handles
+      for (const [x, y] of pts) {
+        const r = isTouch ? 7 : 4.5;
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(x - r, y - r, r * 2, r * 2);
+        ctx.strokeRect(x - r, y - r, r * 2, r * 2);
+      }
+    }
+    // Anchor point
+    const a = toCompSpace(p, primary, t, [anchorOf(p, primary, t)], cam);
+    if (a) crosshair(ctx, toScreen(a[0]));
+  }
+
+  /** Anchor tool: the pivot as a big crosshair plus the 9 points it snaps to. */
+  function drawAnchorTool(ctx: CanvasRenderingContext2D, p: Project, l: Layer, t: number, cam: () => Camera) {
+    if (!canEdit(l)) return;
+    const nine = toCompSpace(p, l, t, ninePoints(boundsOf(p, l, t)), cam);
+    ctx.save();
+    ctx.fillStyle = '#fff';
+    ctx.strokeStyle = ACCENT;
+    ctx.lineWidth = 1.5;
+    for (const q of nine ?? []) {
+      const [x, y] = toScreen(q);
+      ctx.beginPath();
+      ctx.arc(x, y, isTouch ? 4.5 : 3.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    ctx.restore();
+    const a = toCompSpace(p, l, t, [anchorOf(p, l, t)], cam);
+    if (a) crosshair(ctx, toScreen(a[0]), true);
+  }
+
+  function drawMotionPath(ctx: CanvasRenderingContext2D, p: Project, layer: Layer, t: number, cam: () => Camera) {
     const prop = getProp(layer, 'position');
     if (!prop.keys || prop.keys.length < 2) return;
     const pm = parentMatrix(p, layer, t);
+    const pm2 = flat(pm);
+    const three = is3DLayer(layer);
+    const zProp = getProp(layer, 'z');
+    // Position (and Z for 3D layers) at a local key time, on screen; null behind the camera.
+    const at = (v: Vec2, k: number): Vec2 | null => {
+      if (!three) return toScreen(apply(pm2, v));
+      const w = pm.transformPoint(new DOMPoint(v[0], v[1], keyedValue(zProp, k) as number));
+      const q = projectPoint(cam(), w.x, w.y, w.z);
+      return q ? toScreen(q.p) : null;
+    };
     const k0 = prop.keys[0].t;
     const k1 = prop.keys[prop.keys.length - 1].t;
     const steps = Math.min(240, Math.max(16, Math.round((k1 - k0) * p.fps)));
@@ -225,19 +582,26 @@ export function Viewport() {
     ctx.setLineDash([3, 4]);
     ctx.lineWidth = 1.5;
     ctx.beginPath();
+    let drawing = false;
     for (let i = 0; i <= steps; i++) {
-      const v = keyedValue(prop, k0 + ((k1 - k0) * i) / steps) as Vec2;
-      const [sx, sy] = toScreen(apply(pm, v));
-      if (i) ctx.lineTo(sx, sy);
-      else ctx.moveTo(sx, sy);
+      const k = k0 + ((k1 - k0) * i) / steps;
+      const q = at(keyedValue(prop, k) as Vec2, k);
+      if (!q) {
+        drawing = false;
+        continue;
+      }
+      if (drawing) ctx.lineTo(q[0], q[1]);
+      else ctx.moveTo(q[0], q[1]);
+      drawing = true;
     }
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = '#ffc94d';
+    ctx.fillStyle = ANCHOR;
     for (const k of prop.keys) {
-      const [sx, sy] = toScreen(apply(pm, k.v as Vec2));
+      const q = at(k.v as Vec2, k.t);
+      if (!q) continue;
       ctx.save();
-      ctx.translate(sx, sy);
+      ctx.translate(q[0], q[1]);
       ctx.rotate(Math.PI / 4);
       ctx.fillRect(-4, -4, 8, 8);
       ctx.restore();
@@ -262,6 +626,22 @@ export function Viewport() {
     return [e.clientX - r.left, e.clientY - r.top];
   };
 
+  /** The guide line near a screen point (when guides are shown). */
+  function guideAt(p: Project, vs: ViewSettings, pt: Vec2): { axis: 'v' | 'h'; index: number } | null {
+    if (!vs.guides || !p.guides) return null;
+    let best: { axis: 'v' | 'h'; index: number } | null = null;
+    let bd = GUIDE_PX;
+    for (let i = 0; i < p.guides.v.length; i++) {
+      const d = Math.abs(toScreen([p.guides.v[i], 0])[0] - pt[0]);
+      if (d < bd) [bd, best] = [d, { axis: 'v', index: i }];
+    }
+    for (let i = 0; i < p.guides.h.length; i++) {
+      const d = Math.abs(toScreen([0, p.guides.h[i]])[1] - pt[1]);
+      if (d < bd) [bd, best] = [d, { axis: 'h', index: i }];
+    }
+    return best;
+  }
+
   function startPinch() {
     const pts = [...pointers.current.values()];
     const [a, b] = pts;
@@ -272,7 +652,8 @@ export function Viewport() {
       zoom0: view.current.zoom,
       pan0: [...view.current.pan],
     };
-    guides.current = {};
+    snapLines.current = null;
+    down.current = null;
   }
 
   function onPointerDown(e: React.PointerEvent) {
@@ -284,6 +665,7 @@ export function Viewport() {
       return;
     }
     if (pointers.current.size > 2) return;
+    down.current = { pt, at: performance.now() };
     const s = useEditor.getState();
     const p = s.project;
     if (!p) return;
@@ -296,71 +678,143 @@ export function Viewport() {
       return;
     }
     const t = s.time;
-    const sel = layerById(p, s.selectedId);
+    const c = toComp(pt);
     const gid = ++gestureId;
     endMerge();
-    if (sel && sel.visible && !sel.locked && isActive(sel, t) && sel.type !== 'audio' && sel.type !== 'adjustment') {
-      const m = worldMatrix(p, sel, t);
-      const ec = ctxFor(p, sel);
-      const b = localBounds(sel, t, ec);
-      const cs = corners(b);
-      const pts = cs.map((c) => toScreen(apply(m, c)));
+    if (s.tool === 'anchor') {
+      startAnchor(p, s, pt, c, e.altKey);
+      return;
+    }
+    const sel = layerById(p, s.selectedId);
+    if (sel && !s.selection.length && canEdit(sel) && sel.type !== 'adjustment' && !is3DLayer(sel) && activeAt(p, sel, t)) {
+      const { ec, lt } = timesOf(p, sel, t);
+      const m = flat(worldMatrix(p, sel, t));
+      const cs = corners(localBounds(sel, lt, ec, t));
+      const pts = cs.map((q) => toScreen(apply(m, q)));
       const rh = rotateHandle(pts);
-      const anchor = evalPropAt(sel, 'anchor', t, ec) as Vec2;
+      const anchor = vec(sel, 'anchor', lt, ec);
       const center = apply(m, anchor);
-      if (Math.hypot(pt[0] - rh[0], pt[1] - rh[1]) < HANDLE) {
-        const c = toScreen(center);
-        drag.current = { kind: 'rotate', layer: sel.id, r0: evalPropAt(sel, 'rotation', t, ec) as number, a0: Math.atan2(pt[1] - c[1], pt[0] - c[0]), center: c, gid };
+      if (dist(pt, rh) < HANDLE) {
+        const cs0 = toScreen(center);
+        const r0 = evalPropAt(sel, 'rotation', propClock(p, sel, 'rotation', t), ec) as number;
+        drag.current = { kind: 'rotate', layer: sel.id, r0, a0: Math.atan2(pt[1] - cs0[1], pt[0] - cs0[0]), center: cs0, gid };
         return;
       }
-      const hi = pts.findIndex((h) => Math.hypot(pt[0] - h[0], pt[1] - h[1]) < HANDLE);
+      const hi = pts.findIndex((h) => dist(pt, h) < HANDLE);
       if (hi >= 0) {
-        const s0 = evalPropAt(sel, 'scale', t, ec) as Vec2;
-        const pos = evalPropAt(sel, 'position', t, ec) as Vec2;
-        const rot = evalPropAt(sel, 'rotation', t, ec) as number;
-        const base = parentMatrix(p, sel, t).translate(pos[0], pos[1]).rotate(rot);
+        const s0 = evalPropAt(sel, 'scale', propClock(p, sel, 'scale', t), ec) as Vec2;
+        const pos = vec(sel, 'position', lt, ec);
+        const rot = num(sel, 'rotation', lt, ec);
+        const base = flat(parentMatrix(p, sel, t)).translate(pos[0], pos[1]).rotate(rot);
         const h0: Vec2 = [((cs[hi][0] - anchor[0]) * s0[0]) / 100, ((cs[hi][1] - anchor[1]) * s0[1]) / 100];
         drag.current = { kind: 'scale', layer: sel.id, s0, h0, base, gid };
         return;
       }
     }
-    const hit = hitTest(p, toComp(pt), t);
+    const hit = pick(p, c, t, s.selectedId);
     if (hit) {
-      if (hit.id !== s.selectedId) {
+      if (e.shiftKey || e.metaKey || e.ctrlKey) {
+        toggleSelect(hit.id);
+        haptic();
+        drag.current = null;
+        return;
+      }
+      const ids = selectedIds();
+      const keep = ids.length > 1 && ids.includes(hit.id);
+      if (!keep && hit.id !== s.selectedId) {
         select(hit.id);
         haptic();
       }
-      const ec = ctxFor(p, hit);
-      drag.current = {
-        kind: 'move',
-        layer: hit.id,
-        p0: toComp(pt),
-        v0: evalPropAt(hit, 'position', t, ec) as Vec2,
-        inv: parentMatrix(p, hit, t).inverse(),
-        gid,
-        snapped: [false, false],
-      };
+      drag.current = startMove(p, t, keep ? ids : [hit.id], hit.id, pt, c, gid);
     } else {
-      if (s.selectedId) select(null);
+      const g = guideAt(p, s.view, pt);
+      if (g) {
+        drag.current = { kind: 'guide', ...g, value: p.guides![g.axis][g.index], pt, gid };
+        haptic();
+        schedule(true);
+        return;
+      }
+      if (s.selectedId || s.selection.length) select(null);
       drag.current = { kind: 'pan', s0: pt, pan0: [...view.current.pan] };
     }
-    schedule();
+    schedule(true);
+  }
+
+  /** Anchor tool press: grab the selected layer's pivot (or pick a layer when none is selected). */
+  function startAnchor(p: Project, s: EditorState, pt: Vec2, c: Vec2, free: boolean) {
+    const t = s.time;
+    const sel = layerById(p, s.selectedId);
+    if (!sel || !canEdit(sel) || !activeAt(p, sel, t)) {
+      const hit = hitTest(p, c, t, s.selectedId);
+      if (hit) {
+        select(hit.id);
+        haptic();
+      } else drag.current = { kind: 'pan', s0: pt, pan0: [...view.current.pan] };
+      return;
+    }
+    // Pressing on the pivot drags it from where it is; anywhere else, it jumps to the finger.
+    const a = toCompSpace(p, sel, t, [anchorOf(p, sel, t)], lazyCamera(p, t));
+    const as = a && toScreen(a[0]);
+    const off: Vec2 = as && dist(as, pt) < HANDLE * 1.5 ? [as[0] - pt[0], as[1] - pt[1]] : [0, 0];
+    const d: Drag = { kind: 'anchor', layer: sel.id, off, snap: -1 };
+    drag.current = d;
+    if (!off[0] && !off[1]) moveAnchor(d, pt, free);
+  }
+
+  /** Moves the pivot under a screen point, snapping to the layer's 9 box points. */
+  function moveAnchor(d: Extract<Drag, { kind: 'anchor' }>, pt: Vec2, free: boolean) {
+    const s = useEditor.getState();
+    const p = s.project;
+    const l = p && layerById(p, d.layer);
+    if (!p || !l) return;
+    const t = s.time;
+    const cam = lazyCamera(p, t);
+    const target: Vec2 = [pt[0] + d.off[0], pt[1] + d.off[1]];
+    const nine = ninePoints(boundsOf(p, l, t));
+    let uv: Vec2 | null = null;
+    let snap = -1;
+    const scr = !free && s.view.snap ? toCompSpace(p, l, t, nine, cam)?.map(toScreen) : null;
+    if (scr) {
+      // Small on screen: shrink the radius so spots between the points stay reachable.
+      let bd = Math.min(ANCHOR_SNAP_PX, Math.max(3, Math.min(dist(scr[0], scr[1]), dist(scr[0], scr[3])) / 3));
+      scr.forEach((q, i) => {
+        const dd = dist(q, target);
+        if (dd < bd) [bd, snap] = [dd, i];
+      });
+      if (snap >= 0) uv = nine[snap];
+    }
+    if (!uv) {
+      const cp = toComp(target);
+      if (is3DLayer(l)) uv = rayToLayer(p, l, cp, t, cam());
+      else {
+        const inv = flat(worldMatrix(p, l, t)).inverse();
+        if (!Number.isNaN(inv.a)) uv = apply(inv, cp);
+      }
+    }
+    if (!uv) return;
+    if (snap >= 0 && snap !== d.snap) haptic();
+    d.snap = snap;
+    setAnchor(l.id, [round1(uv[0]), round1(uv[1])], `anchor:${l.id}`);
   }
 
   function onPointerMove(e: React.PointerEvent) {
-    if (!pointers.current.has(e.pointerId)) return;
     const pt = local(e);
+    if (!pointers.current.has(e.pointerId)) {
+      if (e.pointerType === 'mouse') hover(pt);
+      return;
+    }
     pointers.current.set(e.pointerId, pt);
     const d = drag.current;
     if (!d) return;
-    const p = useEditor.getState().project;
+    const s = useEditor.getState();
+    const p = s.project;
     if (!p) return;
     switch (d.kind) {
       case 'pinch': {
         const [a, b] = [...pointers.current.values()];
-        const dist = Math.hypot(b[0] - a[0], b[1] - a[1]);
+        const span = Math.hypot(b[0] - a[0], b[1] - a[1]);
         const mid: Vec2 = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-        const z = Math.min(16, Math.max(0.02, d.zoom0 * (dist / d.d0)));
+        const z = Math.min(16, Math.max(0.02, d.zoom0 * (span / d.d0)));
         const k = z / d.zoom0;
         view.current = { zoom: z, pan: [mid[0] - (d.mid0[0] - d.pan0[0]) * k, mid[1] - (d.mid0[1] - d.pan0[1]) * k], fit: false };
         setZoomLabel(Math.round(z * 100));
@@ -375,33 +829,47 @@ export function Viewport() {
         const c = toComp(pt);
         const last = d.points[d.points.length - 1];
         if (Math.hypot(c[0] - last[0], c[1] - last[1]) * view.current.zoom > 1.5) d.points.push(c);
-        schedule();
+        schedule(true);
         break;
       }
       case 'move': {
+        if (!d.moved) {
+          if (dist(pt, d.s0) < MOVE_SLOP) break;
+          d.moved = true;
+        }
         const c = toComp(pt);
-        const dx = c[0] - d.p0[0];
-        const dy = c[1] - d.p0[1];
-        let nx = d.v0[0] + d.inv.a * dx + d.inv.c * dy;
-        let ny = d.v0[1] + d.inv.b * dx + d.inv.d * dy;
-        const layer = layerById(p, d.layer);
-        guides.current = {};
-        if (layer && !layer.parent && !e.altKey) {
-          const tol = 8 / view.current.zoom;
-          const sx = Math.abs(nx - p.width / 2) < tol;
-          const sy = Math.abs(ny - p.height / 2) < tol;
-          if (sx) {
-            nx = p.width / 2;
-            guides.current.x = nx;
-          }
-          if (sy) {
-            ny = p.height / 2;
-            guides.current.y = ny;
-          }
+        let dx = c[0] - d.p0[0];
+        let dy = c[1] - d.p0[1];
+        snapLines.current = null;
+        if (d.box && d.targets && s.view.snap && !e.altKey) {
+          const r = snapBox(moveBox(d.box, dx, dy), d.targets, SNAP_PX / view.current.zoom);
+          dx += r.dx;
+          dy += r.dy;
+          const sx = r.lines.x.length > 0;
+          const sy = r.lines.y.length > 0;
+          if (sx || sy) snapLines.current = r.lines;
           if ((sx && !d.snapped[0]) || (sy && !d.snapped[1])) haptic();
           d.snapped = [sx, sy];
         }
-        setPropValue(d.layer, 'position', [Math.round(nx * 10) / 10, Math.round(ny * 10) / 10], `drag:${d.gid}`);
+        const t = s.time;
+        update((dp) => {
+          for (const it of d.items) {
+            const l = layerById(dp, it.id);
+            if (!l) continue;
+            if (it.at && d.cam) {
+              // 3D: drag on the plane facing the camera, then into the parent's space.
+              const w = screenDeltaToWorld(d.cam, it.at, dx, dy);
+              const a = it.inv.transformPoint(new DOMPoint(it.at[0], it.at[1], it.at[2]));
+              const b = it.inv.transformPoint(new DOMPoint(it.at[0] + w[0], it.at[1] + w[1], it.at[2] + w[2]));
+              writeValue(dp, l, 'position', [round1(it.v0[0] + b.x - a.x), round1(it.v0[1] + b.y - a.y)], t);
+              writeValue(dp, l, 'z', round1((it.z0 ?? 0) + b.z - a.z), t);
+            } else {
+              const nx = it.v0[0] + it.inv.a * dx + it.inv.c * dy;
+              const ny = it.v0[1] + it.inv.b * dx + it.inv.d * dy;
+              writeValue(dp, l, 'position', [round1(nx), round1(ny)], t);
+            }
+          }
+        }, `drag:${d.gid}`);
         break;
       }
       case 'scale': {
@@ -418,20 +886,57 @@ export function Viewport() {
           sx = d.s0[0] * k;
           sy = d.s0[1] * k;
         }
-        setPropValue(d.layer, 'scale', [Math.round(sx * 10) / 10, Math.round(sy * 10) / 10], `drag:${d.gid}`);
+        setPropValue(d.layer, 'scale', [round1(sx), round1(sy)], `drag:${d.gid}`);
         break;
       }
       case 'rotate': {
         const a = Math.atan2(pt[1] - d.center[1], pt[0] - d.center[0]);
         let r = d.r0 + ((a - d.a0) * 180) / Math.PI;
         if (e.shiftKey) r = Math.round(r / 15) * 15;
-        setPropValue(d.layer, 'rotation', Math.round(r * 10) / 10, `drag:${d.gid}`);
+        setPropValue(d.layer, 'rotation', round1(r), `drag:${d.gid}`);
+        break;
+      }
+      case 'anchor':
+        moveAnchor(d, pt, e.altKey);
+        break;
+      case 'guide': {
+        const c = toComp(pt);
+        const extent = d.axis === 'v' ? p.width : p.height;
+        let v = d.axis === 'v' ? c[0] : c[1];
+        if (s.view.snap && !e.altKey) v = snapValue(v, [], s.view.grid ? s.view.gridSize : null, extent, SNAP_PX / view.current.zoom);
+        v = Math.round(v);
+        d.pt = pt;
+        if (v === d.value) {
+          schedule(true);
+          break;
+        }
+        d.value = v;
+        const { axis, index } = d;
+        update((dp) => {
+          const list = dp.guides?.[axis];
+          if (list && index < list.length) list[index] = v;
+        }, `guide:${d.gid}`);
         break;
       }
     }
   }
 
+  /** Desktop: resize cursor over guides that can be dragged. */
+  function hover(pt: Vec2) {
+    const wrap = wrapRef.current;
+    const s = useEditor.getState();
+    const p = s.project;
+    if (!wrap || !p) return;
+    let cursor = '';
+    if (s.tool === 'select') {
+      const g = guideAt(p, s.view, pt);
+      if (g && !pick(p, toComp(pt), s.time, s.selectedId)) cursor = g.axis === 'v' ? 'col-resize' : 'row-resize';
+    }
+    if (wrap.style.cursor !== cursor) wrap.style.cursor = cursor;
+  }
+
   function onPointerUp(e: React.PointerEvent) {
+    const pt = local(e);
     pointers.current.delete(e.pointerId);
     const d = drag.current;
     if (d?.kind === 'pinch') {
@@ -443,21 +948,64 @@ export function Viewport() {
       const b = useEditor.getState().brush;
       addDrawing(simplify(d.points, 1 / view.current.zoom), b.color, b.width);
     }
+    if (d?.kind === 'guide') {
+      // Dropped outside the comp: remove it (same undo step as the move).
+      const p = useEditor.getState().project;
+      const extent = d.axis === 'v' ? p?.width ?? 0 : p?.height ?? 0;
+      if (d.value < 0 || d.value > extent) {
+        const { axis, index } = d;
+        update((dp) => {
+          dp.guides?.[axis].splice(index, 1);
+        }, `guide:${d.gid}`);
+        haptic();
+      }
+    }
+    // A tap on a layer of a multi-selection selects just that layer.
+    if (d?.kind === 'move' && !d.moved && d.items.length > 1) select(d.hit);
     drag.current = null;
-    guides.current = {};
+    snapLines.current = null;
     endMerge();
-    schedule();
+    if (e.type === 'pointerup') detectTap(pt);
+    down.current = null;
+    schedule(true);
   }
 
-  function onDoubleClick(e: React.MouseEvent) {
+  function detectTap(pt: Vec2) {
+    const dn = down.current;
+    if (!dn || pointers.current.size) return;
+    const now = performance.now();
+    if (now - dn.at > 350 || dist(pt, dn.pt) > 10) {
+      lastTap.current = null;
+      return;
+    }
+    const prev = lastTap.current;
+    if (prev && now - prev.at < 400 && dist(prev.pt, pt) < 30) {
+      lastTap.current = null;
+      onDoubleTap(pt);
+    } else lastTap.current = { pt, at: now };
+  }
+
+  /** Double-tap/click: enter a group (select the child under the pointer), open a layer's properties, or fit an empty area. */
+  function onDoubleTap(pt: Vec2) {
     const s = useEditor.getState();
-    if (!s.project) return;
-    const r = wrapRef.current!.getBoundingClientRect();
-    const hit = hitTest(s.project, toComp([e.clientX - r.left, e.clientY - r.top]), s.time);
-    if (hit) {
-      select(hit.id);
-      openSheet('props');
-    } else fitView();
+    const p = s.project;
+    if (!p || s.tool !== 'select') return;
+    const c = toComp(pt);
+    const hit = pick(p, c, s.time, s.selectedId);
+    if (!hit) {
+      if (!guideAt(p, s.view, pt)) fitView();
+      return;
+    }
+    if (hit.type === 'group') {
+      const child = hitTest(p, c, s.time, hit.id);
+      if (child && child.id !== hit.id) {
+        select(child.id);
+        haptic();
+      }
+      return;
+    }
+    select(hit.id);
+    openSheet('props');
   }
 
   const spaceDown = useRef(false);
@@ -487,13 +1035,13 @@ export function Viewport() {
     window.addEventListener('keydown', kd);
     window.addEventListener('keyup', ku);
     const unsub = useEditor.subscribe((s, prev) => {
-      if (s.project !== prev.project || s.time !== prev.time || s.selectedId !== prev.selectedId || s.previewQuality !== prev.previewQuality || s.playing !== prev.playing) {
+      if (s.project !== prev.project || s.time !== prev.time || s.previewQuality !== prev.previewQuality || s.playing !== prev.playing) {
         if (s.project && prev.project && (s.project.width !== prev.project.width || s.project.height !== prev.project.height)) fitView();
         schedule();
-      }
+      } else if (s.selectedId !== prev.selectedId || s.selection !== prev.selection || s.view !== prev.view || s.tool !== prev.tool) schedule(true);
     });
-    const unMedia = media.onChange(schedule);
-    const unFonts = onFontsChanged(schedule);
+    const unMedia = media.onChange(() => schedule());
+    const unFonts = onFontsChanged(() => schedule());
     const onFit = () => fitView();
     window.addEventListener('xm:fit', onFit);
     fitView();
@@ -507,24 +1055,19 @@ export function Viewport() {
       unMedia();
       unFonts();
       cancelAnimationFrame(raf.current);
+      // Let a remount (StrictMode runs effects twice in development) schedule frames again.
+      raf.current = 0;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
-    <div className={`viewport ${tool === 'pen' ? 'pen' : ''}`}>
-      <div
-        ref={wrapRef}
-        className="viewport-wrap"
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-        onDoubleClick={onDoubleClick}
-      >
+    <div className={`viewport ${tool === 'pen' ? 'pen' : ''} ${tool === 'anchor' ? 'anchor' : ''}`}>
+      <div ref={wrapRef} className="viewport-wrap" onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp}>
         <canvas ref={canvasRef} className="comp-canvas" />
         <canvas ref={overlayRef} className="overlay-canvas" />
       </div>
+      <ViewMenu />
       <div className="zoom-ctl">
         <button type="button" onClick={() => setZoom(view.current.zoom / 1.25)} aria-label="Zoom out">
           <Icon name="minus" size={14} />
@@ -537,6 +1080,7 @@ export function Viewport() {
         </button>
       </div>
       {tool === 'pen' && <PenBar color={brush.color} width={brush.width} />}
+      {tool === 'anchor' && <AnchorBar />}
     </div>
   );
 }
@@ -552,6 +1096,37 @@ function PenBar({ color, width }: { color: string; width: number }) {
         <input type="color" value={color.slice(0, 7)} onChange={(e) => setBrush({ color: e.target.value })} />
       </label>
       <input type="range" min={1} max={80} value={width} onChange={(e) => setBrush({ width: Number(e.target.value) })} aria-label="Brush size" />
+      <button type="button" className="btn primary small" onClick={() => useEditor.setState({ tool: 'select' })}>
+        Done
+      </button>
+    </div>
+  );
+}
+
+/** Anchor tool bar: hint, center the pivot, and Done. */
+function AnchorBar() {
+  const usable = useEditor((s) => {
+    const l = s.project ? layerById(s.project, s.selectedId) : undefined;
+    return !!l && canEdit(l);
+  });
+  const center = () => {
+    const { project: p, selectedId, time } = useEditor.getState();
+    const l = p ? layerById(p, selectedId) : undefined;
+    if (!p || !l) return;
+    const b = boundsOf(p, l, time);
+    endMerge();
+    setAnchor(l.id, [round1(b.x + b.w / 2), round1(b.y + b.h / 2)]);
+  };
+  return (
+    <div className="pen-bar anchor-bar">
+      <span className="anchor-title">
+        <Icon name="anchor" size={16} /> {usable ? 'Drag the anchor' : 'Tap a layer'}
+      </span>
+      {usable && (
+        <button type="button" className="btn small" onClick={center}>
+          Center
+        </button>
+      )}
       <button type="button" className="btn primary small" onClick={() => useEditor.setState({ tool: 'select' })}>
         Done
       </button>
