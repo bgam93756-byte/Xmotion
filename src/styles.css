@@ -949,6 +949,8 @@ h4 {
   top: 5px;
   bottom: 5px;
   border-radius: 8px;
+  background: #2a2540;
+  border: 1px solid var(--c);
   background: color-mix(in srgb, var(--c) 32%, #15161c);
   border: 1px solid color-mix(in srgb, var(--c) 60%, transparent);
   overflow: hidden;

@@ -13,6 +13,7 @@ import {
   QUALITY_MEDIUM,
   QUALITY_VERY_HIGH,
   WebMOutputFormat,
+  canEncodeAudio,
   getFirstEncodableAudioCodec,
   getFirstEncodableVideoCodec,
   type Quality,
@@ -222,6 +223,12 @@ export async function exportProject(project: Project, opts: ExportOptions, onPro
     const audio = await mixdown(project, opts.from, opts.to);
     let audioSource: AudioBufferSource | null = null;
     if (audio) {
+      // Older Safari has no WebCodecs audio encoder: load a WASM AAC encoder on demand.
+      if (isMp4 && !(await canEncodeAudio('aac', { numberOfChannels: 2, sampleRate: audio.sampleRate }).catch(() => false))) {
+        onProgress(0, 'Loading audio encoder…');
+        const { registerAacEncoder } = await import('@mediabunny/aac-encoder');
+        registerAacEncoder();
+      }
       const acodec = await getFirstEncodableAudioCodec(isMp4 ? ['aac', 'opus'] : ['opus', 'vorbis'], {
         numberOfChannels: 2,
         sampleRate: audio.sampleRate,

@@ -21,6 +21,11 @@ on:
 permissions:
   contents: write
 
+# A newer push supersedes an in-flight build of the same branch.
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ipa:
     runs-on: macos-15

@@ -96,10 +96,11 @@ export function Timeline() {
   const onScroll = () => {
     const el = scrollRef.current!;
     const s = useEditor.getState();
+    // While playing, scroll position follows the clock; user input pauses first (pointerdown/wheel).
+    if (s.playing) return;
     const t = el.scrollLeft / pps;
     const tol = Math.max(0.5 / project.fps, 1.5 / pps);
     if (Math.abs(t - s.time) <= tol) return;
-    if (s.playing) stop();
     fromScroll.current = true;
     setTime(Math.min(project.duration, t));
     fromScroll.current = false;
@@ -110,6 +111,7 @@ export function Timeline() {
   useEffect(() => {
     const el = scrollRef.current!;
     const wheel = (e: WheelEvent) => {
+      if (useEditor.getState().playing && Math.abs(e.deltaX) > Math.abs(e.deltaY)) stop();
       if (e.ctrlKey || e.metaKey) {
         e.preventDefault();
         zoomBy(Math.exp(-e.deltaY * 0.01));

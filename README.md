@@ -90,6 +90,6 @@ npm run build      # typecheck + production build into dist/
 
 ## Known limitations
 
-- Video export needs WebCodecs: **iOS 16.4 or later** for MP4/WebM. GIF and PNG export work everywhere.
+- The iOS app requires **iOS 16.4 or later** (the first iOS with WebCodecs video encoding). On older Safari versions without a native AAC encoder, a bundled WASM AAC encoder is loaded automatically so exports still have sound.
 - Google Fonts download on first use; offline, text falls back to the system font until the font has been cached.
 - There are no 3D layers or shape masks yet. Clipping masks and keying cover most masking needs for now.

@@ -122,8 +122,17 @@ export function buildShape(p: ShapeParams): ShapeGeom {
   switch (p.kind) {
     case 'rect': {
       const r = Math.max(0, Math.min(p.radius, w / 2, h / 2));
-      if (r > 0) path.roundRect(-w / 2, -h / 2, w, h, r);
-      else path.rect(-w / 2, -h / 2, w, h);
+      if (r > 0) {
+        // Manual rounded rect: Path2D.roundRect is missing on older WebKit.
+        const x = -w / 2;
+        const y = -h / 2;
+        path.moveTo(x + r, y);
+        path.arcTo(x + w, y, x + w, y + h, r);
+        path.arcTo(x + w, y + h, x, y + h, r);
+        path.arcTo(x, y + h, x, y, r);
+        path.arcTo(x, y, x + w, y, r);
+        path.closePath();
+      } else path.rect(-w / 2, -h / 2, w, h);
       length = 2 * (w + h) - 8 * r + 2 * Math.PI * r;
       break;
     }
