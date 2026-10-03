@@ -36,7 +36,7 @@ A keyframe motion-graphics and video editor for **iPhone and iPad** (also runs i
 
 Building an `.ipa` needs Xcode on macOS. A GitHub Actions workflow does this for you.
 
-1. Open the repo on GitHub, then **Actions › Build iOS app (.ipa) › Run workflow**. It also runs automatically on pushes to `main` and on `v*` tags; tagged builds are attached to a GitHub Release.
+1. Open the repo on GitHub, then **Actions › Build iOS app (.ipa)**. It runs automatically on every push that changes the app (any branch), and you can also start it with **Run workflow** on `main`. Builds from `v*` tags are attached to a GitHub Release.
 2. When the run finishes, download the **Xmotion-ipa** artifact and unzip it to get `Xmotion.ipa`.
 
 The CI build is **unsigned**. iOS only installs signed apps, so pick one of these options.

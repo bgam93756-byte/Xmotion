@@ -6,8 +6,17 @@ name: Build iOS app (.ipa)
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: ['**']
     tags: ['v*']
+    paths:
+      - 'src/**'
+      - 'ios/**'
+      - 'public/**'
+      - 'index.html'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'capacitor.config.ts'
+      - '.github/workflows/ios.yml'
 
 permissions:
   contents: write
