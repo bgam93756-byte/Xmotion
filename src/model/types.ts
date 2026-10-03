@@ -55,7 +55,9 @@ export type BlendMode =
   | 'luminosity'
   | 'add';
 
-export type LayerType = 'shape' | 'text' | 'image' | 'video' | 'audio' | 'null' | 'adjustment';
+export type LayerType = 'shape' | 'text' | 'image' | 'video' | 'audio' | 'null' | 'adjustment' | 'group' | 'camera';
+/** A mask hides the layers below it in the same container (root or group). */
+export type MaskMode = 'none' | 'alpha' | 'alphaInv' | 'luma' | 'lumaInv';
 export type ShapeKind = 'rect' | 'ellipse' | 'polygon' | 'star' | 'path';
 export type FillType = 'solid' | 'linear' | 'radial';
 export type TextAnimator = 'none' | 'typewriter' | 'fade' | 'pop' | 'slideUp' | 'drop' | 'scramble' | 'blurIn';
@@ -82,7 +84,18 @@ export interface Layer {
   blend: BlendMode;
   /** Clipping mask: only draw where the layer below is opaque. */
   clip: boolean;
+  /** Use this layer as a mask for everything below it in its container. */
+  maskMode?: MaskMode;
+  /** Parent layer (a sibling in the same container). */
   parent?: string | null;
+  /** 3D layer: has Z position and X/Y rotation, seen through the camera. */
+  threeD?: boolean;
+  /** Time remapping: the layer runs on its keyframeable `timeRemap` clock. */
+  timeRemapOn?: boolean;
+  /** Group layers: children, index 0 on top. */
+  children?: Layer[];
+  /** Group collapsed in the timeline. */
+  collapsed?: boolean;
   /** Timeline label color. */
   label?: string;
   props: Record<string, Prop>;
@@ -148,6 +161,8 @@ export interface Project {
   /** Index 0 is the top-most layer. */
   layers: Layer[];
   assets: AssetMeta[];
+  /** Guide lines in comp pixels (vertical = x positions, horizontal = y positions). */
+  guides?: { v: number[]; h: number[] };
   motionBlur: MotionBlur;
   created: number;
   modified: number;

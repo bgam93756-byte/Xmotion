@@ -28,6 +28,8 @@ const TYPE_ICON: Record<Layer['type'], IconName> = {
   audio: 'music',
   null: 'null',
   adjustment: 'adjust',
+  group: 'group',
+  camera: 'camera',
 };
 
 export function layerIcon(l: Layer): IconName {

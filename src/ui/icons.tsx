@@ -57,6 +57,18 @@ const paths: Record<string, string> = {
   graph: 'M3 21c6 0 6-18 18-18',
   keyframe: 'M12 5l7 7-7 7-7-7z',
   magnet: 'M6 3v8a6 6 0 0012 0V3M6 7h4M14 7h4',
+  group: 'M3 7V3h4M17 3h4v4M21 17v4h-4M7 21H3v-4M8 8h8v8H8z',
+  ungroup: 'M4 4h7v7H4zM13 13h7v7h-7z',
+  camera: 'M3 8h3l2-3h8l2 3h3v11H3zM12 17a4 4 0 100-8 4 4 0 000 8z',
+  cube: 'M12 2l9 5v10l-9 5-9-5V7zM12 22V12M21 7l-9 5-9-5',
+  mask: 'M4 4h16v16H4zM12 8a4 4 0 100 8 4 4 0 000-8z',
+  clock: 'M12 21a9 9 0 100-18 9 9 0 000 18zM12 7v5l3 2',
+  anchor: 'M12 15a3 3 0 100-6 3 3 0 000 6zM12 2v5M12 17v5M2 12h5M17 12h5',
+  grid: 'M4 4h16v16H4zM4 9.3h16M4 14.7h16M9.3 4v16M14.7 4v16',
+  guides: 'M8 3v18M3 15h18',
+  paste: 'M9 3h6v3H9zM8 4.5H5V21h14V4.5h-3',
+  bookmark: 'M6 3h12v18l-6-4-6 4z',
+  reset: 'M3 12a9 9 0 103-6.7L3 8M3 3v5h5',
 };
 
 export type IconName = keyof typeof paths;

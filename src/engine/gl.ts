@@ -282,3 +282,29 @@ export function glfx(): GLFX | null {
   }
   return shared;
 }
+
+/**
+ * Perspective warp for 3D layers: u_inv maps an output pixel to homogeneous
+ * source-buffer pixels; its third component is 1 / camera depth.
+ */
+export const WARP_FRAG = `
+uniform mat3 u_inv;
+uniform vec2 u_src;
+void main() {
+  vec3 q = u_inv * vec3(pix(), 1.0);
+  if (q.z <= 0.0 || q.z > 1.0) { gl_FragColor = vec4(0.0); return; }
+  vec2 sp = q.xy / q.z;
+  vec2 uv = vec2(sp.x / u_src.x, 1.0 - sp.y / u_src.y);
+  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) { gl_FragColor = vec4(0.0); return; }
+  gl_FragColor = texture2D(u_tex, uv);
+}`;
+
+/** Turns a layer into a luminance matte: alpha = luma × alpha (inverted: 1 − that). */
+export const LUMA_MATTE_FRAG = `
+uniform float u_invert;
+void main() {
+  vec4 c = unpre(tex(v_uv));
+  float m = lum(c.rgb) * c.a;
+  m = mix(m, 1.0 - m, u_invert);
+  gl_FragColor = vec4(0.0, 0.0, 0.0, m);
+}`;

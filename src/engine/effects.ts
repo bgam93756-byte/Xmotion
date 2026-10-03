@@ -2,6 +2,7 @@ import type { Effect, Layer, Vec2 } from '../model/types';
 import { col, num, vec, type EvalContext } from '../model/animate';
 import { rgbaFloat } from '../model/color';
 import { seedFromString } from '../model/noise';
+import { findLayer } from '../model/tree';
 import { SPEC, isPixelEffect } from '../effects';
 import type { FxApply, FxEval, ShapeMod, TextMod, TransformOut } from '../effects/types';
 import { glfx, type Common, type Pass } from './gl';
@@ -46,7 +47,7 @@ export function makeEval(layer: Layer, e: Effect, t: number, ec: EvalContext, sc
     },
     ref: (k) => {
       const id = e.refs?.[k];
-      return id && ec.project.layers.some((l) => l.id === id) ? id : undefined;
+      return id && findLayer(ec.project, id) ? id : undefined;
     },
     t,
     local: t - layer.start,

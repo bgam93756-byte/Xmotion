@@ -1,8 +1,8 @@
-import type { AssetMeta, Project } from '../model/types';
+import type { AssetMeta, Layer, Project } from '../model/types';
 import { uid } from '../model/ids';
 
 const DB_NAME = 'xmotion';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 export interface ProjectSummary {
   id: string;
@@ -34,6 +34,7 @@ function db(): Promise<IDBDatabase> {
         const d = req.result;
         if (!d.objectStoreNames.contains('projects')) d.createObjectStore('projects', { keyPath: 'id' });
         if (!d.objectStoreNames.contains('assets')) d.createObjectStore('assets', { keyPath: 'id' });
+        if (!d.objectStoreNames.contains('elements')) d.createObjectStore('elements', { keyPath: 'id' });
       };
       req.onsuccess = () => res(req.result);
       req.onerror = () => rej(req.error);
@@ -85,10 +86,54 @@ export async function deleteProject(id: string): Promise<void> {
   const project = await loadProject(id);
   await tx('projects', 'readwrite', (s) => s.delete(id));
   if (!project) return;
-  // Drop assets no other project references.
-  const others = await tx<ProjectRecord[]>('projects', 'readonly', (s) => s.getAll());
-  const used = new Set(others.flatMap((r) => r.project.assets.map((a) => a.id)));
+  // Drop assets nothing else references (other projects, saved elements, the clipboard).
+  const used = await usedAssets();
   for (const a of project.assets) if (!used.has(a.id)) await tx('assets', 'readwrite', (s) => s.delete(a.id));
+}
+
+async function usedAssets(): Promise<Set<string>> {
+  const projects = await tx<ProjectRecord[]>('projects', 'readonly', (s) => s.getAll());
+  const elements = await listElements();
+  const used = new Set(projects.flatMap((r) => r.project.assets.map((a) => a.id)));
+  for (const e of elements) for (const a of e.assets) used.add(a.id);
+  try {
+    const clip = JSON.parse(localStorage.getItem('xm.clipboard') ?? 'null') as { assets?: AssetMeta[] } | null;
+    for (const a of clip?.assets ?? []) used.add(a.id);
+  } catch {
+    /* no clipboard */
+  }
+  return used;
+}
+
+/* ---------- Elements: reusable layers saved across projects ---------- */
+
+export interface ElementRecord {
+  id: string;
+  name: string;
+  created: number;
+  /** Top to bottom, in the coordinates of the comp they came from. */
+  layers: Layer[];
+  assets: AssetMeta[];
+  width: number;
+  height: number;
+  thumb?: string;
+}
+
+export async function listElements(): Promise<ElementRecord[]> {
+  const all = await tx<ElementRecord[]>('elements', 'readonly', (s) => s.getAll());
+  return all.sort((a, b) => b.created - a.created);
+}
+
+export async function saveElement(rec: ElementRecord): Promise<void> {
+  await tx('elements', 'readwrite', (s) => s.put(rec));
+}
+
+export async function deleteElement(id: string): Promise<void> {
+  const rec = await tx<ElementRecord | undefined>('elements', 'readonly', (s) => s.get(id));
+  await tx('elements', 'readwrite', (s) => s.delete(id));
+  if (!rec) return;
+  const used = await usedAssets();
+  for (const a of rec.assets) if (!used.has(a.id)) await tx('assets', 'readwrite', (s) => s.delete(a.id));
 }
 
 export async function duplicateProject(id: string): Promise<Project | undefined> {

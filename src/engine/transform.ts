@@ -1,13 +1,48 @@
 import type { Layer, Project, Vec2 } from '../model/types';
 import { num, vec, type EvalContext } from '../model/animate';
+import { allLayers, ancestors, findLayer } from '../model/tree';
 import { buildShape, outlinePoints, type Rect } from './shapes';
-import { makeEval, transformFx } from './effects';
+import { layerTimeFx, makeEval, transformFx } from './effects';
 import { layoutText } from './text';
 import { media } from './media';
+import { activeCamera, rayToLayer } from './camera';
 
 export function ctxFor(project: Project, layer: Layer): EvalContext {
-  return { project, index: project.layers.indexOf(layer) + 1 };
+  const f = findLayer(project, layer.id);
+  return { project, index: (f?.index ?? 0) + 1 };
 }
+
+/* ---------------- time ---------------- */
+
+/**
+ * The time a layer runs on, given the time of its container:
+ * time remapping first, then effects such as Time Quantization.
+ */
+export function layerTime(layer: Layer, t: number, ec: EvalContext): number {
+  let lt = t;
+  if (layer.timeRemapOn) lt = layer.start + num(layer, 'timeRemap', t, ec);
+  return layer.effects.length ? layerTimeFx(layer, lt, ec) : lt;
+}
+
+/** The clock of the container holding a layer (comp time at the root, group time inside groups). */
+export function containerTime(project: Project, layer: Layer, compT: number): number {
+  let t = compT;
+  for (const g of ancestors(project, layer.id)) t = layerTime(g, t, ctxFor(project, g));
+  return t;
+}
+
+/** Container time and the layer's own time at a comp time. */
+export function timesOf(project: Project, layer: Layer, compT: number) {
+  const ec = ctxFor(project, layer);
+  const ct = containerTime(project, layer, compT);
+  return { ec, ct, lt: layerTime(layer, ct, ec) };
+}
+
+export function isActive(layer: Layer, t: number) {
+  return t >= layer.start && t < layer.end;
+}
+
+/* ---------------- geometry ---------------- */
 
 export function shapeParams(layer: Layer, t: number, ctx: EvalContext) {
   const [w, h] = vec(layer, 'size', t, ctx);
@@ -24,10 +59,11 @@ export function shapeParams(layer: Layer, t: number, ctx: EvalContext) {
 }
 
 /** A shape layer's outline in comp coordinates. */
-export function outlineComp(project: Project, layer: Layer, t: number): Vec2[] {
+export function outlineComp(project: Project, layer: Layer, compT: number): Vec2[] {
   if (layer.type !== 'shape') return [];
-  const m = worldMatrix(project, layer, t);
-  return outlinePoints(shapeParams(layer, t, ctxFor(project, layer))).map((p) => apply(m, p));
+  const m = worldMatrix(project, layer, compT);
+  const { ec, lt } = timesOf(project, layer, compT);
+  return outlinePoints(shapeParams(layer, lt, ec)).map((p) => apply(m, p));
 }
 
 /** Point and tangent angle (radians) at fraction f along a polyline. */
@@ -45,67 +81,94 @@ export function alongPath(pts: Vec2[], f: number, wrap: boolean): { p: Vec2; ang
   return { p: [x0 + (x1 - x0) * u, y0 + (y1 - y0) * u], ang: Math.atan2(y1 - y0, x1 - x0) };
 }
 
-export function localMatrix(layer: Layer, t: number, ctx: EvalContext): DOMMatrix {
-  let [px, py] = vec(layer, 'position', t, ctx);
-  const [sx, sy] = vec(layer, 'scale', t, ctx);
-  let rot = num(layer, 'rotation', t, ctx);
-  const [ax, ay] = vec(layer, 'anchor', t, ctx);
+/**
+ * Local transform at the layer's own time `lt`. 3D layers (and cameras) get a
+ * full 3D matrix with Z position and X/Y rotation; 2D layers stay flat.
+ */
+export function localMatrix(layer: Layer, lt: number, ctx: EvalContext, project?: Project, compT?: number): DOMMatrix {
+  let [px, py] = vec(layer, 'position', lt, ctx);
+  const [sx, sy] = layer.type === 'camera' ? [100, 100] : vec(layer, 'scale', lt, ctx);
+  let rot = num(layer, 'rotation', lt, ctx);
+  const [ax, ay] = layer.type === 'camera' ? [0, 0] : vec(layer, 'anchor', lt, ctx);
+  const is3D = (layer.threeD && layer.type !== 'group') || layer.type === 'camera';
   let fsx = 1;
   let fsy = 1;
   if (layer.effects.length) {
-    const fx = transformFx(layer, t, ctx);
+    const fx = transformFx(layer, lt, ctx);
     px += fx.dx;
     py += fx.dy;
     rot += fx.rot;
     fsx = fx.sx;
     fsy = fx.sy;
     const mp = layer.effects.find((e) => e.enabled && e.type === 'moveAlongPath');
-    const ref = mp?.refs?.path ? ctx.project.layers.find((l) => l.id === mp.refs!.path && l.id !== layer.id) : undefined;
-    if (mp && ref) {
-      const pts = outlineComp(ctx.project, ref, t);
+    const ref = mp?.refs?.path && project ? findLayer(project, mp.refs.path)?.layer : undefined;
+    if (mp && ref && ref.id !== layer.id && project && compT !== undefined) {
+      const pts = outlineComp(project, ref, compT);
       if (pts.length > 1) {
-        const ev = makeEval(layer, mp, t, ctx);
+        const ev = makeEval(layer, mp, lt, ctx);
         const closed = Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 0.5;
         const { p, ang } = alongPath(pts, ev.n('progress') / 100 + ev.n('speed') * ev.local, closed);
-        const inv = parentMatrix(ctx.project, layer, t).inverse();
+        const inv = parentMatrix(project, layer, compT).inverse();
         [px, py] = apply(inv, p);
         rot += ev.n('rotation') + (ev.o('orient') === 0 ? (ang * 180) / Math.PI : 0);
       }
     }
   }
   const m = new DOMMatrix();
-  m.translateSelf(px, py);
-  m.rotateSelf(rot);
+  if (is3D) {
+    m.translateSelf(px, py, num(layer, 'z', lt, ctx));
+    m.rotateSelf(0, 0, rot);
+    m.rotateSelf(0, num(layer, 'rotY', lt, ctx), 0);
+    m.rotateSelf(num(layer, 'rotX', lt, ctx), 0, 0);
+  } else {
+    m.translateSelf(px, py);
+    m.rotateSelf(rot);
+  }
+  const skew = layer.type === 'camera' ? 0 : num(layer, 'skew', lt, ctx);
+  if (skew) {
+    const axis = num(layer, 'skewAxis', lt, ctx);
+    m.rotateSelf(axis);
+    m.skewXSelf(Math.max(-85, Math.min(85, skew)));
+    m.rotateSelf(-axis);
+  }
   m.scaleSelf((sx / 100) * fsx, (sy / 100) * fsy);
   m.translateSelf(-ax, -ay);
   return m;
 }
 
-/** Comp-space matrix for a layer, including its parent chain. */
-export function worldMatrix(project: Project, layer: Layer, t: number, depth = 0): DOMMatrix {
-  const m = localMatrix(layer, t, ctxFor(project, layer));
-  if (!layer.parent || depth > 16) return m;
-  const parent = project.layers.find((l) => l.id === layer.parent);
-  if (!parent) return m;
-  return worldMatrix(project, parent, t, depth + 1).multiply(m);
+/**
+ * Local → comp matrix at comp time `compT`, including parents and enclosing
+ * groups. 2D renderers use its 2D part (a–f); 3D layers use the full matrix.
+ */
+export function worldMatrix(project: Project, layer: Layer, compT: number, depth = 0): DOMMatrix {
+  const { ec, lt } = timesOf(project, layer, compT);
+  const local = localMatrix(layer, lt, ec, project, compT);
+  if (depth > 24) return local;
+  return parentMatrix(project, layer, compT, depth).multiply(local);
 }
 
-export function parentMatrix(project: Project, layer: Layer, t: number): DOMMatrix {
-  const parent = layer.parent ? project.layers.find((l) => l.id === layer.parent) : undefined;
-  return parent ? worldMatrix(project, parent, t) : new DOMMatrix();
+/** The space a layer's position lives in: its parent layer, else its group, else the comp. */
+export function parentMatrix(project: Project, layer: Layer, compT: number, depth = 0): DOMMatrix {
+  const found = findLayer(project, layer.id);
+  if (layer.parent) {
+    const parent = found?.list.find((l) => l.id === layer.parent);
+    if (parent && parent.id !== layer.id) return worldMatrix(project, parent, compT, depth + 1);
+  }
+  if (found?.group) return worldMatrix(project, found.group, compT, depth + 1);
+  return new DOMMatrix();
 }
 
-/** Content bounds in the layer's local space (before transform). */
-export function localBounds(layer: Layer, t: number, ctx: EvalContext): Rect {
+/** Content bounds in the layer's local space (before transform), at the layer's own time. */
+export function localBounds(layer: Layer, lt: number, ctx: EvalContext, compT?: number): Rect {
   switch (layer.type) {
     case 'shape': {
-      const g = buildShape(shapeParams(layer, t, ctx));
-      const sw = layer.strokeOn ? num(layer, 'strokeWidth', t, ctx) / 2 : 0;
+      const g = buildShape(shapeParams(layer, lt, ctx));
+      const sw = layer.strokeOn ? num(layer, 'strokeWidth', lt, ctx) / 2 : 0;
       const b = g.bounds;
       return { x: b.x - sw, y: b.y - sw, w: b.w + sw * 2, h: b.h + sw * 2 };
     }
     case 'text':
-      return layoutText(layer, num(layer, 'fontSize', t, ctx), num(layer, 'tracking', t, ctx), num(layer, 'lineHeight', t, ctx)).bounds;
+      return layoutText(layer, num(layer, 'fontSize', lt, ctx), num(layer, 'tracking', lt, ctx), num(layer, 'lineHeight', lt, ctx)).bounds;
     case 'image':
     case 'video': {
       const a = media.get(layer.asset);
@@ -115,9 +178,37 @@ export function localBounds(layer: Layer, t: number, ctx: EvalContext): Rect {
     }
     case 'adjustment':
       return { x: -ctx.project.width / 2, y: -ctx.project.height / 2, w: ctx.project.width, h: ctx.project.height };
+    case 'group':
+      return groupBounds(ctx.project, layer, compT ?? lt);
     default:
       return { x: -40, y: -40, w: 80, h: 80 };
   }
+}
+
+/** Union of a group's (active, visible) children, in the group's local space. */
+function groupBounds(project: Project, group: Layer, compT: number): Rect {
+  const kids = group.children ?? [];
+  if (!kids.length) return { x: -40, y: -40, w: 80, h: 80 };
+  const inv = worldMatrix(project, group, compT).inverse();
+  let x0 = Infinity,
+    y0 = Infinity,
+    x1 = -Infinity,
+    y1 = -Infinity;
+  for (const c of kids) {
+    if (!c.visible || c.type === 'audio' || c.type === 'camera' || c.maskMode) continue;
+    const { ec, ct, lt } = timesOf(project, c, compT);
+    if (!isActive(c, ct)) continue;
+    const rel = inv.multiply(worldMatrix(project, c, compT));
+    for (const p of corners(localBounds(c, lt, ec, compT))) {
+      const [x, y] = apply(rel, p);
+      x0 = Math.min(x0, x);
+      y0 = Math.min(y0, y);
+      x1 = Math.max(x1, x);
+      y1 = Math.max(y1, y);
+    }
+  }
+  if (!Number.isFinite(x0)) return { x: -40, y: -40, w: 80, h: 80 };
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
 export function corners(r: Rect): Vec2[] {
@@ -133,22 +224,95 @@ export function apply(m: DOMMatrix, [x, y]: Vec2): Vec2 {
   return [m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f];
 }
 
-export function isActive(layer: Layer, t: number) {
-  return t >= layer.start && t < layer.end;
+/* ---------------- hit testing ---------------- */
+
+const notSelectable = (l: Layer) => l.type === 'audio' || l.type === 'adjustment' || l.type === 'camera';
+
+function hitLayer(project: Project, layer: Layer, p: Vec2, compT: number): boolean {
+  const { ec, lt } = timesOf(project, layer, compT);
+  const b = localBounds(layer, lt, ec, compT);
+  let lx: number;
+  let ly: number;
+  let pad = 6;
+  if (layer.threeD && layer.type !== 'group') {
+    const hit = rayToLayer(project, layer, p, compT, activeCamera(project, compT));
+    if (!hit) return false;
+    [lx, ly] = hit;
+  } else {
+    const m = worldMatrix(project, layer, compT);
+    const inv = m.inverse();
+    if (Number.isNaN(inv.a)) return false;
+    [lx, ly] = apply(inv, p);
+    pad = 6 / Math.max(0.05, Math.hypot(m.a, m.b));
+  }
+  return lx >= b.x - pad && lx <= b.x + b.w + pad && ly >= b.y - pad && ly <= b.y + b.h + pad;
 }
 
-/** Top-most selectable layer under a comp-space point. */
-export function hitTest(project: Project, p: Vec2, t: number): Layer | null {
-  for (const layer of project.layers) {
-    if (!layer.visible || layer.locked || !isActive(layer, t)) continue;
-    if (layer.type === 'audio' || layer.type === 'adjustment') continue;
-    const m = worldMatrix(project, layer, t);
-    const inv = m.inverse();
-    if (Number.isNaN(inv.a)) continue;
-    const [lx, ly] = apply(inv, p);
-    const b = localBounds(layer, t, ctxFor(project, layer));
-    const pad = 6 / Math.max(0.05, Math.hypot(m.a, m.b));
-    if (lx >= b.x - pad && lx <= b.x + b.w + pad && ly >= b.y - pad && ly <= b.y + b.h + pad) return layer;
+/**
+ * Top-most selectable layer under a comp-space point. Groups are picked as a
+ * whole unless they are "open" (the selection is the group or inside it), in
+ * which case their children can be picked directly.
+ */
+export function hitTest(project: Project, p: Vec2, compT: number, selectedId?: string | null): Layer | null {
+  const open = new Set<string>();
+  if (selectedId) {
+    const sel = findLayer(project, selectedId)?.layer;
+    if (sel?.type === 'group') open.add(sel.id);
+    for (const g of ancestors(project, selectedId)) open.add(g.id);
   }
-  return null;
+  const search = (list: Layer[], t: number): Layer | null => {
+    for (const layer of list) {
+      if (!layer.visible || layer.locked || layer.maskMode || !isActive(layer, t)) continue;
+      if (layer.type === 'group') {
+        const inner = search(layer.children ?? [], layerTime(layer, t, ctxFor(project, layer)));
+        if (inner) return open.has(layer.id) ? inner : layer;
+        continue;
+      }
+      if (notSelectable(layer)) continue;
+      if (hitLayer(project, layer, p, compT)) return layer;
+    }
+    return null;
+  };
+  return search(project.layers, compT);
+}
+
+/** All layers whose content intersects a comp-space point (used for snapping exclusions etc.). */
+export function selectableLayers(project: Project): Layer[] {
+  return allLayers(project).filter((l) => !notSelectable(l));
+}
+
+/* ---------------- clocks for editing, media and audio ---------------- */
+
+/**
+ * Whether a layer shows at comp time `compT`: visible and inside its time
+ * window, and so is every group around it.
+ */
+export function activeAt(project: Project, layer: Layer, compT: number): boolean {
+  let t = compT;
+  for (const g of ancestors(project, layer.id)) {
+    if (!g.visible || !isActive(g, t)) return false;
+    t = layerTime(g, t, ctxFor(project, g));
+  }
+  return layer.visible && isActive(layer, t);
+}
+
+/**
+ * Time on the clock a property's keyframes live on (relative keys add
+ * layer.start): the container clock, then time remapping. Time remap keys
+ * themselves live on the container clock.
+ */
+export function propClock(project: Project, layer: Layer, path: string, compT: number): number {
+  const ct = containerTime(project, layer, compT);
+  if (path === 'timeRemap' || !layer.timeRemapOn) return ct;
+  return layer.start + num(layer, 'timeRemap', ct, ctxFor(project, layer));
+}
+
+/** True when the layer or a group around it is time remapped (its media can't simply play). */
+export function isRetimed(project: Project, layer: Layer): boolean {
+  return !!layer.timeRemapOn || ancestors(project, layer.id).some((g) => g.timeRemapOn);
+}
+
+/** Comp time → time on the layer's own clock, for media source time (remap included). */
+export function mediaClock(project: Project, layer: Layer, compT: number): number {
+  return timesOf(project, layer, compT).lt;
 }

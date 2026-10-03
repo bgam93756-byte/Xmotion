@@ -1,4 +1,6 @@
 import type { AssetKind, AssetMeta, Layer, Project } from '../model/types';
+import { allLayers } from '../model/tree';
+import { activeAt, isRetimed, mediaClock } from './transform';
 import { uid } from '../model/ids';
 import { registerFontFile } from './fonts';
 
@@ -196,18 +198,20 @@ export class MediaRegistry {
 
   /** Keeps preview video elements in sync with the playhead. */
   syncVideos(project: Project, t: number, playing: boolean) {
-    for (const layer of project.layers) {
+    const live = new Set<string>();
+    for (const layer of allLayers(project)) {
       if (layer.type !== 'video') continue;
+      live.add(layer.id);
       const v = this.video(layer);
       if (!v) continue;
-      const active = layer.visible && t >= layer.start && t < layer.end;
-      const target = sourceTime(layer, t);
+      const active = activeAt(project, layer, t);
+      const target = sourceTime(layer, mediaClock(project, layer, t));
       if (!active) {
         if (!v.paused) v.pause();
         continue;
       }
       const speed = layer.speed ?? 1;
-      if (playing) {
+      if (playing && !isRetimed(project, layer)) {
         if (v.playbackRate !== speed) v.playbackRate = Math.min(16, Math.max(0.0625, speed));
         if (Math.abs(v.currentTime - target) > 0.25) v.currentTime = target;
         if (v.paused) void v.play().catch(() => undefined);
@@ -218,7 +222,7 @@ export class MediaRegistry {
     }
     // Drop elements of deleted layers.
     for (const [id, v] of this.videos) {
-      if (!project.layers.some((l) => l.id === id)) {
+      if (!live.has(id)) {
         v.pause();
         v.removeAttribute('src');
         v.load();
@@ -239,7 +243,7 @@ export class MediaRegistry {
   }
 }
 
-/** Source-media time shown by a media layer at comp time t. */
+/** Source-media time shown by a media layer at time t on its own clock. */
 export function sourceTime(layer: Layer, t: number): number {
   return Math.max(0, (layer.trimIn ?? 0) + (t - layer.start) * (layer.speed ?? 1));
 }

@@ -1,8 +1,25 @@
 import type { Layer, Project } from '../model/types';
+import { allLayers, effectiveWindow } from '../model/tree';
 import { media } from './media';
+import { isRetimed } from './transform';
 
 const hasAudio = (l: Layer) =>
   (l.type === 'audio' || l.type === 'video') && !!l.asset && l.visible && !l.muted && (l.volume ?? 1) > 0;
+
+/**
+ * Audible clips anywhere in the tree, with their window clipped to the
+ * enclosing groups. Time-remapped clips are skipped (their audio would need resampling).
+ */
+function audible(project: Project): Layer[] {
+  const out: Layer[] = [];
+  for (const l of allLayers(project)) {
+    if (!hasAudio(l) || isRetimed(project, l)) continue;
+    const w = effectiveWindow(project, l);
+    if (!w.visible || w.end <= w.start) continue;
+    out.push(w.start === l.start && w.end === l.end ? l : { ...l, start: w.start, end: w.end, trimIn: (l.trimIn ?? 0) + (w.start - l.start) * (l.speed ?? 1) });
+  }
+  return out;
+}
 
 /** Clip gain at comp time t, including fade in/out. */
 function gainAt(l: Layer, t: number): number {
@@ -19,8 +36,8 @@ function gainAt(l: Layer, t: number): number {
  */
 async function schedule(ctx: BaseAudioContext, project: Project, from: number, when: number, until: number): Promise<AudioScheduledSourceNode[]> {
   const nodes: AudioScheduledSourceNode[] = [];
-  for (const l of project.layers) {
-    if (!hasAudio(l) || l.end <= from || l.start >= until) continue;
+  for (const l of audible(project)) {
+    if (l.end <= from || l.start >= until) continue;
     const buf = await media.audioBuffer(l.asset!);
     if (!buf) continue;
     const speed = l.speed ?? 1;
@@ -96,7 +113,7 @@ export class AudioPlayer {
 export const audioPlayer = new AudioPlayer();
 
 export function projectHasAudio(project: Project) {
-  return project.layers.some(hasAudio);
+  return audible(project).length > 0;
 }
 
 /** Offline mixdown of a comp range (for export). */

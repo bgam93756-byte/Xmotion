@@ -1,10 +1,13 @@
 import type { BlendMode, Layer, Project, Vec2 } from '../model/types';
 import { col, num, type EvalContext } from '../model/animate';
-import { applyEffects, hasPixelEffects, layerTimeFx, opacityFx, renderFx, shapeFx, textFx, type FxContext } from './effects';
+import { findLayer } from '../model/tree';
+import { applyEffects, hasPixelEffects, opacityFx, renderFx, shapeFx, textFx, type FxContext } from './effects';
 import { media } from './media';
 import { buildShape, outlinePoints, type Rect } from './shapes';
 import { drawText, layoutText } from './text';
-import { isActive, localBounds, outlineComp, shapeParams, worldMatrix } from './transform';
+import { corners, isActive, localBounds, outlineComp, shapeParams, timesOf, worldMatrix } from './transform';
+import { activeCamera, depthAt, glMat3, homography, inv3, mul3, projectLocal, type Camera, type Mat3 } from './camera';
+import { glfx, LUMA_MATTE_FRAG, WARP_FRAG, type Common } from './gl';
 
 export interface RenderOpts {
   /** Output pixels per comp pixel. */
@@ -119,10 +122,26 @@ function taperStroke(ctx: CanvasRenderingContext2D, pts: Vec2[], from: number, t
   }
 }
 
-/** Draws one layer's own content (no opacity/blend/effects) with its world transform. */
-function drawLayer(ctx: CanvasRenderingContext2D, project: Project, layer: Layer, t: number, s: number, ec: EvalContext) {
-  const m = worldMatrix(project, layer, t);
-  ctx.setTransform(s * m.a, s * m.b, s * m.c, s * m.d, s * m.e, s * m.f);
+/** Flattens a (possibly 3D) matrix to its 2D part, as 2D layers are drawn. */
+export function flat(m: DOMMatrix): DOMMatrix {
+  return m.is2D ? m : new DOMMatrix([m.a, m.b, m.c, m.d, m.e, m.f]);
+}
+
+/** Local → output-pixel matrix of a 2D layer at comp time `compT`. */
+function pixelMatrix(project: Project, layer: Layer, compT: number, s: number): DOMMatrix {
+  return new DOMMatrix([s, 0, 0, s, 0, 0]).multiply(flat(worldMatrix(project, layer, compT)));
+}
+
+export const is3DLayer = (l: Layer) => !!l.threeD && l.type !== 'group' && l.type !== 'camera';
+export const isMask = (l: Layer) => !!l.maskMode && l.maskMode !== 'none';
+const isDrawable = (l: Layer) => l.type !== 'audio' && l.type !== 'null' && l.type !== 'camera';
+
+/**
+ * Draws one layer's own content (no opacity/blend/effects) at its layer time
+ * `t`, with `m` mapping local coordinates to target pixels.
+ */
+function drawContent(ctx: CanvasRenderingContext2D, layer: Layer, t: number, ec: EvalContext, m: DOMMatrix) {
+  ctx.setTransform(m.a, m.b, m.c, m.d, m.e, m.f);
   const mod = layer.effects.length ? shapeFx(layer, t, ec) : {};
   switch (layer.type) {
     case 'shape': {
@@ -203,7 +222,54 @@ function drawLayer(ctx: CanvasRenderingContext2D, project: Project, layer: Layer
   }
 }
 
-const isDrawable = (l: Layer) => l.type !== 'audio' && l.type !== 'null';
+/** State shared while rendering one frame. */
+interface Frame {
+  project: Project;
+  compT: number;
+  s: number;
+  W: number;
+  H: number;
+  cam: Camera | null;
+}
+
+const NO_COMMON: Common = {
+  time: 0,
+  ltime: 0,
+  scale: 1,
+  seed: 0,
+  toLocal: new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]),
+  toBuf: new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]),
+  lb: [0, 0, 1, 1],
+};
+
+function copyInto(dst: HTMLCanvasElement, src: CanvasImageSource) {
+  const c = dst.getContext('2d')!;
+  c.save();
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.globalAlpha = 1;
+  c.globalCompositeOperation = 'copy';
+  c.drawImage(src, 0, 0);
+  c.restore();
+}
+
+/** Replaces a buffer with its luminance matte (alpha = luma × alpha). */
+function lumaMatte(buf: HTMLCanvasElement) {
+  const gl = glfx();
+  if (gl) {
+    copyInto(buf, gl.run(buf, buf.width, buf.height, [{ frag: LUMA_MATTE_FRAG, u: { u_invert: 0 } }], NO_COMMON));
+    return;
+  }
+  const c = buf.getContext('2d')!;
+  const img = c.getImageData(0, 0, buf.width, buf.height);
+  const d = img.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const a = d[i + 3] / 255;
+    const m = a > 0 ? ((0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255 / a) * a : 0;
+    d[i] = d[i + 1] = d[i + 2] = 0;
+    d[i + 3] = Math.round(Math.min(1, m) * 255);
+  }
+  c.putImageData(img, 0, 0);
+}
 
 export class Renderer {
   private pool = new CanvasPool();
@@ -241,17 +307,73 @@ export class Renderer {
   }
 
   private frame(project: Project, t: number, ctx: CanvasRenderingContext2D, W: number, H: number, opts: RenderOpts) {
-    const s = opts.scale;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
     ctx.clearRect(0, 0, W, H);
-    if (!opts.transparent) {
+    const f: Frame = { project, compT: t, s: opts.scale, W, H, cam: null };
+    // Masks at the root would also cut the background, so render above it in isolation.
+    if (!opts.transparent && project.layers.some(isMask)) {
+      const buf = this.pool.acquire(W, H);
+      this.container(f, project.layers, buf.getContext('2d')!, t);
       ctx.fillStyle = project.background;
       ctx.fillRect(0, 0, W, H);
+      ctx.drawImage(buf, 0, 0);
+      this.pool.release(buf);
+    } else {
+      if (!opts.transparent) {
+        ctx.fillStyle = project.background;
+        ctx.fillRect(0, 0, W, H);
+      }
+      this.container(f, project.layers, ctx, t);
     }
-    const layers = project.layers;
-    const fx = (layer: Layer, lt: number, ec: EvalContext) => this.fxContext(project, layer, lt, ec, W, H, s, ctx);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+
+  private camera(f: Frame): Camera {
+    return (f.cam ??= activeCamera(f.project, f.compT));
+  }
+
+  /**
+   * Bottom-to-top drawing order of a container: runs of adjacent 3D layers are
+   * sorted far to near so they overlap by depth.
+   */
+  private order(f: Frame, list: Layer[], ct: number): number[] {
+    const idx: number[] = [];
+    for (let i = list.length - 1; i >= 0; i--) if (isDrawable(list[i])) idx.push(i);
+    const sortable = (l: Layer) => is3DLayer(l) && !isMask(l) && !l.clip && l.visible && isActive(l, ct);
+    for (let a = 0; a < idx.length; ) {
+      if (!sortable(list[idx[a]])) {
+        a++;
+        continue;
+      }
+      let b = a;
+      while (b < idx.length && sortable(list[idx[b]])) b++;
+      if (b - a > 1) {
+        const cam = this.camera(f);
+        const run = idx.slice(a, b).map((i, k) => {
+          const l = list[i];
+          const { ec, lt } = timesOf(f.project, l, f.compT);
+          const lb = localBounds(l, lt, ec, f.compT);
+          const Hm = homography(cam, worldMatrix(f.project, l, f.compT));
+          return { i, k, d: depthAt(Hm, lb.x + lb.w / 2, lb.y + lb.h / 2) };
+        });
+        run.sort((p, q) => q.d - p.d || p.k - q.k);
+        run.forEach((r, k) => (idx[a + k] = r.i));
+      }
+      a = b;
+    }
+    return idx;
+  }
+
+  private opacityOf(layer: Layer, lt: number, ec: EvalContext) {
+    return Math.min(1, Math.max(0, (num(layer, 'opacity', lt, ec) / 100) * (layer.effects.length ? opacityFx(layer, lt, ec) : 1)));
+  }
+
+  /** Composites a container's layers (root or a group's children) into ctx; `ct` is the container's clock. */
+  private container(f: Frame, list: Layer[], ctx: CanvasRenderingContext2D, ct: number) {
+    const { project, W, H } = f;
+    const order = this.order(f, list, ct);
 
     let pending: { buf: HTMLCanvasElement; opacity: number; blend: BlendMode } | null = null;
     const composite = (src: HTMLCanvasElement, opacity: number, blend: BlendMode) => {
@@ -268,30 +390,36 @@ export class Renderer {
       this.pool.release(pending.buf);
       pending = null;
     };
-    const nextAboveClips = (i: number) => {
-      for (let j = i - 1; j >= 0; j--) if (isDrawable(layers[j])) return layers[j].clip;
+    const nextAboveClips = (k: number) => {
+      for (let j = k + 1; j < order.length; j++) {
+        const l = list[order[j]];
+        if (isMask(l)) return false;
+        return l.clip;
+      }
       return false;
     };
 
-    for (let i = layers.length - 1; i >= 0; i--) {
-      const layer = layers[i];
-      if (!isDrawable(layer)) continue;
-      const visible = layer.visible && isActive(layer, t);
+    for (let k = 0; k < order.length; k++) {
+      const layer = list[order[k]];
+      const visible = layer.visible && isActive(layer, ct);
+      if (isMask(layer)) {
+        flush();
+        if (visible) this.applyMask(f, layer, ctx);
+        continue;
+      }
       if (!visible) {
         if (!layer.clip) flush();
         continue;
       }
-      const ec: EvalContext = { project, index: i + 1 };
-      const lt = layer.effects.length ? layerTimeFx(layer, t, ec) : t;
-      const opacity = Math.min(1, Math.max(0, (num(layer, 'opacity', lt, ec) / 100) * (layer.effects.length ? opacityFx(layer, lt, ec) : 1)));
+      const { ec, lt } = timesOf(project, layer, f.compT);
+      const opacity = this.opacityOf(layer, lt, ec);
 
       if (layer.type === 'adjustment') {
         flush();
         if (opacity <= 0) continue;
         const buf = this.pool.acquire(W, H);
-        const bctx = buf.getContext('2d')!;
-        bctx.drawImage(ctx.canvas, 0, 0);
-        applyEffects(layer, buf, fx(layer, lt, ec));
+        buf.getContext('2d')!.drawImage(ctx.canvas, 0, 0);
+        applyEffects(layer, buf, this.fxContext(f, layer, lt, ec, ctx.canvas));
         composite(buf, opacity, layer.blend);
         this.pool.release(buf);
         continue;
@@ -299,9 +427,7 @@ export class Renderer {
 
       if (layer.clip) {
         if (!pending || opacity <= 0) continue;
-        const buf = this.pool.acquire(W, H);
-        this.drawLayerFx(buf.getContext('2d')!, project, layer, lt, s, ec, W, H);
-        applyEffects(layer, buf, fx(layer, lt, ec));
+        const buf = this.layerBuffer(f, layer, lt, ec, ctx.canvas);
         const p = pending as { buf: HTMLCanvasElement };
         const pctx = p.buf.getContext('2d')!;
         pctx.save();
@@ -317,76 +443,184 @@ export class Renderer {
       flush();
       if (opacity <= 0) continue;
       const needsBuffer =
-        nextAboveClips(i) || hasPixelEffects(layer) || (opacity < 1 && (layer.type === 'shape' || layer.type === 'text'));
+        nextAboveClips(k) ||
+        layer.type === 'group' ||
+        is3DLayer(layer) ||
+        hasPixelEffects(layer) ||
+        (opacity < 1 && (layer.type === 'shape' || layer.type === 'text'));
       if (!needsBuffer) {
         ctx.save();
         ctx.globalAlpha = opacity;
         ctx.globalCompositeOperation = BLEND[layer.blend];
-        drawLayer(ctx, project, layer, lt, s, ec);
+        drawContent(ctx, layer, lt, ec, pixelMatrix(project, layer, f.compT, f.s));
         ctx.restore();
         continue;
       }
-      const buf = this.pool.acquire(W, H);
-      this.drawLayerFx(buf.getContext('2d')!, project, layer, lt, s, ec, W, H);
-      applyEffects(layer, buf, fx(layer, lt, ec));
-      pending = { buf, opacity, blend: layer.blend };
+      pending = { buf: this.layerBuffer(f, layer, lt, ec, ctx.canvas), opacity, blend: layer.blend };
     }
     flush();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
 
-  private fxContext(project: Project, layer: Layer, t: number, ec: EvalContext, W: number, H: number, s: number, main: CanvasRenderingContext2D): FxContext {
-    const m = new DOMMatrix([s, 0, 0, s, 0, 0]).multiply(worldMatrix(project, layer, t));
+  /** A layer's pixels (content + effects, without opacity/blend) in a pooled frame-sized buffer. */
+  private layerBuffer(f: Frame, layer: Layer, lt: number, ec: EvalContext, bg: HTMLCanvasElement | null): HTMLCanvasElement {
+    if (is3DLayer(layer)) return this.render3D(f, layer, lt, ec, bg);
+    const buf = this.pool.acquire(f.W, f.H);
+    if (layer.type === 'group') this.container(f, layer.children ?? [], buf.getContext('2d')!, lt);
+    else this.drawLayerFx(buf.getContext('2d')!, f, layer, lt, ec, null);
+    applyEffects(layer, buf, this.fxContext(f, layer, lt, ec, bg));
+    return buf;
+  }
+
+  /** Masks everything drawn so far in the container. */
+  private applyMask(f: Frame, layer: Layer, ctx: CanvasRenderingContext2D) {
+    const { ec, lt } = timesOf(f.project, layer, f.compT);
+    const opacity = this.opacityOf(layer, lt, ec);
+    const mode = layer.maskMode!;
+    const inverted = mode === 'alphaInv' || mode === 'lumaInv';
+    if (inverted && opacity <= 0) return;
+    const buf = this.layerBuffer(f, layer, lt, ec, ctx.canvas);
+    if (mode === 'luma' || mode === 'lumaInv') lumaMatte(buf);
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = opacity;
+    ctx.globalCompositeOperation = inverted ? 'destination-out' : 'destination-in';
+    ctx.drawImage(buf, 0, 0);
+    ctx.restore();
+    this.pool.release(buf);
+  }
+
+  /**
+   * 3D layers are drawn flat into a buffer in their own plane (where their
+   * effects run), then projected through the camera with a perspective warp.
+   */
+  private render3D(f: Frame, layer: Layer, lt: number, ec: EvalContext, bg: HTMLCanvasElement | null): HTMLCanvasElement {
+    const { project, s, W, H } = f;
+    const out = this.pool.acquire(W, H);
+    const cam = this.camera(f);
+    const Hc = homography(cam, worldMatrix(project, layer, f.compT));
+    const lb = localBounds(layer, lt, ec, f.compT);
+    const lw = Math.max(1, lb.w);
+    const lh = Math.max(1, lb.h);
+
+    // Resolution: local units → buffer pixels, matched to the projected size.
+    let k = s;
+    const cs = corners(lb).map(([u, v]) => projectLocal(Hc, u, v));
+    if (cs.every(Boolean)) {
+      const [a, b, c, d] = cs as Vec2[];
+      const dist = (p: Vec2, q: Vec2) => Math.hypot(p[0] - q[0], p[1] - q[1]);
+      k = s * Math.max(Math.max(dist(a, b), dist(d, c)) / lw, Math.max(dist(a, d), dist(b, c)) / lh);
+    }
+    k = Math.min(4 * s, Math.max(0.02, k));
+    const fxPad = hasPixelEffects(layer) ? Math.max(lw, lh) * 0.15 + 24 : 0;
+    const maxDim = Math.min(4096, Math.ceil(2 * Math.max(W, H)));
+    let pad = fxPad + 2 / k;
+    let bw = (lw + 2 * pad) * k;
+    let bh = (lh + 2 * pad) * k;
+    const fit = Math.min(1, maxDim / bw, maxDim / bh, Math.sqrt(8e6 / (bw * bh)));
+    if (fit < 1) {
+      k *= fit;
+      pad = fxPad + 2 / k;
+      bw = (lw + 2 * pad) * k;
+      bh = (lh + 2 * pad) * k;
+    }
+    const Bw = Math.max(1, Math.ceil(bw));
+    const Bh = Math.max(1, Math.ceil(bh));
+    const ox = lb.x - pad;
+    const oy = lb.y - pad;
+    const L = new DOMMatrix([k, 0, 0, k, -k * ox, -k * oy]);
+
+    const src = this.pool.acquire(Bw, Bh);
+    this.drawLayerFx(src.getContext('2d')!, f, layer, lt, ec, L);
+    applyEffects(layer, src, this.fxContext(f, layer, lt, ec, bg, L, k, [Bw, Bh]));
+
+    // Output pixel → comp → local plane → source pixel.
+    const inv = inv3(Hc);
+    if (inv) {
+      const Lm: Mat3 = [k, 0, -k * ox, 0, k, -k * oy, 0, 0, 1];
+      const Sinv: Mat3 = [1 / s, 0, 0, 0, 1 / s, 0, 0, 0, 1];
+      const M = mul3(Lm, mul3(inv, Sinv));
+      const gl = glfx();
+      if (gl) {
+        copyInto(out, gl.run(src, W, H, [{ frag: WARP_FRAG, u: { u_inv: glMat3(M), u_src: [Bw, Bh] } }], NO_COMMON));
+      } else {
+        // Without WebGL: an affine approximation from three projected corners.
+        const toOut = (x: number, y: number) => projectLocal(Hc, ox + x / k, oy + y / k);
+        const p0 = toOut(0, 0);
+        const p1 = toOut(Bw, 0);
+        const p2 = toOut(0, Bh);
+        if (p0 && p1 && p2) {
+          const octx = out.getContext('2d')!;
+          octx.setTransform(((p1[0] - p0[0]) / Bw) * s, ((p1[1] - p0[1]) / Bw) * s, ((p2[0] - p0[0]) / Bh) * s, ((p2[1] - p0[1]) / Bh) * s, p0[0] * s, p0[1] * s);
+          octx.drawImage(src, 0, 0);
+          octx.setTransform(1, 0, 0, 1, 0, 0);
+        }
+      }
+    }
+    this.pool.release(src);
+    return out;
+  }
+
+  private fxContext(f: Frame, layer: Layer, lt: number, ec: EvalContext, bg: HTMLCanvasElement | null, m?: DOMMatrix, scale?: number, size?: [number, number]): FxContext {
+    const { project, s, W, H } = f;
     return {
-      t,
-      scale: s,
+      t: lt,
+      scale: scale ?? s,
       ec,
-      m,
-      lb: localBounds(layer, t, ec),
-      tempCanvas: () => this.temp(W, H),
-      background: () => main.canvas,
+      m: m ?? pixelMatrix(project, layer, f.compT, s),
+      lb: localBounds(layer, lt, ec, f.compT),
+      tempCanvas: () => this.temp(size?.[0] ?? W, size?.[1] ?? H),
+      background: () => bg,
       renderRef: (id) => {
-        const ref = project.layers.find((l) => l.id === id);
+        const ref = findLayer(project, id)?.layer;
         if (!ref || ref.id === layer.id || this.refDepth > 0) return null;
         this.refDepth++;
         try {
+          const r = timesOf(project, ref, f.compT);
+          const buf = this.layerBuffer(f, ref, r.lt, r.ec, null);
           const c = this.refCanvas(W, H);
-          const rctx = c.getContext('2d')!;
-          const rec: EvalContext = { project, index: project.layers.indexOf(ref) + 1 };
-          rctx.save();
-          drawLayer(rctx, project, ref, t, s, rec);
-          rctx.restore();
-          applyEffects(ref, c, this.fxContext(project, ref, t, rec, W, H, s, main));
+          c.getContext('2d')!.drawImage(buf, 0, 0);
+          this.pool.release(buf);
           return c;
         } finally {
           this.refDepth--;
         }
       },
       refPath: (id) => {
-        const ref = project.layers.find((l) => l.id === id);
+        const ref = findLayer(project, id)?.layer;
         if (!ref || ref.id === layer.id) return null;
-        return outlineComp(project, ref, t).map(([x, y]) => [x * s, y * s] as Vec2);
+        return outlineComp(project, ref, f.compT).map(([x, y]) => [x * s, y * s] as Vec2);
       },
     };
   }
 
-  /** Draws a layer, including Echo Keyframes and per-layer Motion Blur. */
-  private drawLayerFx(bctx: CanvasRenderingContext2D, project: Project, layer: Layer, t: number, s: number, ec: EvalContext, W: number, H: number) {
-    const rf = layer.effects.length ? renderFx(layer, t, ec) : [];
+  /**
+   * Draws a layer, including Echo Keyframes and per-layer Motion Blur. With
+   * `fixed` (3D layers) the layer is drawn in its own plane with that matrix.
+   */
+  private drawLayerFx(bctx: CanvasRenderingContext2D, f: Frame, layer: Layer, lt: number, ec: EvalContext, fixed: DOMMatrix | null) {
+    const { project, s } = f;
+    const rf = layer.effects.length ? renderFx(layer, lt, ec) : [];
     const blur = rf.find((r) => r.kind === 'motionBlur');
     const echo = rf.find((r) => r.kind === 'echo');
-    const drawMain = (c: CanvasRenderingContext2D, tt: number) => {
-      if (!blur) return drawLayer(c, project, layer, tt, s, ec);
+    const drawAt = (c: CanvasRenderingContext2D, compT: number) => {
+      const r = compT === f.compT ? { lt, ec } : timesOf(project, layer, compT);
+      drawContent(c, layer, r.lt, r.ec, fixed ?? pixelMatrix(project, layer, compT, s));
+    };
+    const cw = bctx.canvas.width;
+    const ch = bctx.canvas.height;
+    const drawMain = (c: CanvasRenderingContext2D, compT: number) => {
+      if (!blur) return drawAt(c, compT);
       const n = Math.max(2, Math.min(48, Math.round(blur.ev.n('samples'))));
       const shutter = blur.ev.n('shutter') / 360 / project.fps;
-      const acc = this.pool.acquire(W, H);
-      const tmp = this.pool.acquire(W, H);
+      const acc = this.pool.acquire(cw, ch);
+      const tmp = this.pool.acquire(cw, ch);
       const actx = acc.getContext('2d')!;
       const tctx = tmp.getContext('2d')!;
       for (let k = 0; k < n; k++) {
         tctx.setTransform(1, 0, 0, 1, 0, 0);
-        tctx.clearRect(0, 0, W, H);
-        drawLayer(tctx, project, layer, Math.max(layer.start, tt + (k / (n - 1) - 0.5) * shutter), s, ec);
+        tctx.clearRect(0, 0, cw, ch);
+        drawAt(tctx, compT + (k / (n - 1) - 0.5) * shutter);
         actx.setTransform(1, 0, 0, 1, 0, 0);
         actx.globalAlpha = 1 / (k + 1);
         actx.drawImage(tmp, 0, 0);
@@ -398,7 +632,7 @@ export class Renderer {
       this.pool.release(acc);
       this.pool.release(tmp);
     };
-    if (!echo) return drawMain(bctx, t);
+    if (!echo) return drawMain(bctx, f.compT);
     const n = Math.round(echo.ev.n('count'));
     const delay = echo.ev.n('delay');
     const start = echo.ev.n('start') / 100;
@@ -406,8 +640,8 @@ export class Renderer {
     const behind = echo.ev.o('order') === 0;
     const echoes = () => {
       for (let k = behind ? n : 1; behind ? k >= 1 : k <= n; k += behind ? -1 : 1) {
-        const tt = t - k * delay;
-        if (tt < layer.start) continue;
+        const tt = f.compT - k * delay;
+        if (timesOf(project, layer, tt).ct < layer.start) continue;
         bctx.save();
         bctx.globalAlpha = start * Math.max(0, 1 - ((k - 1) / Math.max(1, n)) * decay);
         drawMain(bctx, tt);
@@ -415,7 +649,7 @@ export class Renderer {
       }
     };
     if (behind) echoes();
-    drawMain(bctx, t);
+    drawMain(bctx, f.compT);
     if (!behind) echoes();
   }
 

@@ -24,6 +24,8 @@ import type { Layer, Project } from '../model/types';
 import { mixdown } from './audio';
 import { waitForFonts } from './fonts';
 import { media, sourceTime } from './media';
+import { allLayers } from '../model/tree';
+import { activeAt, mediaClock } from './transform';
 import { Renderer, free } from './renderer';
 
 export type ExportFormat = 'mp4' | 'webm' | 'gif' | 'png';
@@ -75,13 +77,16 @@ class VideoFrames {
   ) {}
 
   async init() {
-    for (const layer of this.project.layers) {
+    for (const layer of allLayers(this.project)) {
       if (layer.type !== 'video' || !layer.visible) continue;
       const blob = media.blobOf(layer.asset ?? '');
       if (!blob) continue;
-      const stamps = this.times.filter((t) => t >= layer.start && t < layer.end).map((t) => sourceTime(layer, t));
+      const stamps = this.times.filter((t) => activeAt(this.project, layer, t)).map((t) => sourceTime(layer, mediaClock(this.project, layer, t)));
+      // The decoder walks forward only; retimed clips that run backwards use seeking.
+      const forward = stamps.every((s, i) => i === 0 || s >= stamps[i - 1]);
       if (!stamps.length) continue;
       try {
+        if (!forward) throw new Error('non-monotonic');
         const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) });
         this.inputs.push(input);
         const track = await input.getPrimaryVideoTrack();
@@ -106,8 +111,8 @@ class VideoFrames {
   /** Sets media.frameOverrides for every active video layer at comp time t. */
   async prepare(t: number) {
     const map = new Map<string, CanvasImageSource>();
-    for (const layer of this.project.layers) {
-      if (layer.type !== 'video' || t < layer.start || t >= layer.end) continue;
+    for (const layer of allLayers(this.project)) {
+      if (layer.type !== 'video' || !activeAt(this.project, layer, t)) continue;
       const it = this.iters.get(layer.id);
       if (it) {
         const r = await it.next();
@@ -117,7 +122,7 @@ class VideoFrames {
       }
       const v = this.fallback.get(layer.id);
       if (v) {
-        await seek(v, sourceTime(layer, t));
+        await seek(v, sourceTime(layer, mediaClock(this.project, layer, t)));
         map.set(layer.id, v);
       }
     }
@@ -146,7 +151,7 @@ function seek(v: HTMLVideoElement, t: number): Promise<void> {
 }
 
 function fontsOf(project: Project) {
-  return project.layers
+  return allLayers(project)
     .filter((l: Layer) => l.type === 'text')
     .map((l) => ({ family: l.font ?? 'Inter', weight: l.weight ?? 400, italic: !!l.italic }));
 }

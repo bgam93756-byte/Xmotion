@@ -1,6 +1,7 @@
 import type { Effect, Layer, LayerType, Project, Prop, PropValue, ShapeKind, Vec2 } from './types';
 import { uid } from './ids';
 import { EFFECT_DEFS } from './effectDefs';
+import { allLayers } from './tree';
 
 export type PropKind = 'number' | 'vec2' | 'color';
 
@@ -37,8 +38,29 @@ export const TRANSFORM_DEFS: PropDef[] = [
   P('scale', 'Scale', 'vec2', [100, 100], { unit: '%', step: 1 }),
   P('rotation', 'Rotation', 'number', 0, { unit: '°', step: 1 }),
   P('opacity', 'Opacity', 'number', 100, { min: 0, max: 100, unit: '%', slider: true }),
-  P('anchor', 'Anchor', 'vec2', [0, 0], { step: 1 }),
+  P('anchor', 'Anchor (pivot)', 'vec2', [0, 0], { step: 1 }),
+  P('skew', 'Skew', 'number', 0, { min: -85, max: 85, unit: '°', slider: true }),
+  P('skewAxis', 'Skew axis', 'number', 0, { unit: '°' }),
 ];
+
+/** Extra transform properties of 3D layers (X/Y/Z). */
+export const THREE_D_DEFS: PropDef[] = [
+  P('z', 'Z position', 'number', 0, { step: 1 }),
+  P('rotX', 'X rotation', 'number', 0, { unit: '°', step: 1 }),
+  P('rotY', 'Y rotation', 'number', 0, { unit: '°', step: 1 }),
+];
+
+export const CAMERA_DEFS: PropDef[] = [
+  P('position', 'Position', 'vec2', [0, 0], { step: 1 }),
+  P('z', 'Z position', 'number', -1500, { step: 1 }),
+  P('rotX', 'Tilt (X rotation)', 'number', 0, { unit: '°' }),
+  P('rotY', 'Pan (Y rotation)', 'number', 0, { unit: '°' }),
+  P('rotation', 'Roll (Z rotation)', 'number', 0, { unit: '°' }),
+  P('zoom', 'Zoom (focal length)', 'number', 1500, { min: 50, max: 20000, unit: 'px', step: 10 }),
+];
+
+/** Time remapping: the layer's internal time (seconds since its start). */
+export const TIME_REMAP_DEF: PropDef = P('timeRemap', 'Time remap', 'number', 0, { unit: 's', step: 0.01 });
 
 const OPACITY_DEF = TRANSFORM_DEFS[3];
 
@@ -84,6 +106,8 @@ export const LAYER_COLORS: Record<LayerType, string> = {
   audio: '#3fe08f',
   null: '#9aa0aa',
   adjustment: '#d9dde4',
+  group: '#c58cff',
+  camera: '#6ad6c4',
 };
 
 export function shapeDefs(kind: ShapeKind): PropDef[] {
@@ -106,7 +130,14 @@ export function propSections(layer: Layer): PropSection[] {
   const out: PropSection[] = [];
   if (layer.type === 'audio') return out;
   if (layer.type === 'adjustment') return [{ title: 'Adjustment', defs: [OPACITY_DEF] }];
-  out.push({ title: 'Transform', defs: TRANSFORM_DEFS });
+  if (layer.type === 'camera') return [{ title: 'Camera', defs: CAMERA_DEFS }];
+  const [position, scale, rotation, opacity, anchor, skew, skewAxis] = TRANSFORM_DEFS;
+  out.push({
+    title: 'Transform',
+    defs: layer.threeD
+      ? [position, THREE_D_DEFS[0], scale, { ...rotation, label: 'Z rotation' }, THREE_D_DEFS[1], THREE_D_DEFS[2], opacity, anchor, skew, skewAxis]
+      : [position, scale, rotation, opacity, anchor, skew, skewAxis],
+  });
   if (layer.type === 'shape') {
     const sd = shapeDefs(layer.shape ?? 'rect');
     if (sd.length) out.push({ title: 'Shape', defs: sd });
@@ -119,11 +150,12 @@ export function propSections(layer: Layer): PropSection[] {
     out.push({ title: 'Stroke', defs: STROKE_DEFS });
     out.push({ title: 'Text animation', defs: TEXT_ANIM_DEFS });
   }
+  if (layer.timeRemapOn) out.push({ title: 'Time remapping', defs: [TIME_REMAP_DEF] });
   return out;
 }
 
 const ALL_LAYER_DEFS = new Map<string, PropDef>(
-  [TRANSFORM_DEFS, FILL_DEFS, STROKE_DEFS, TRIM_DEFS, TEXT_DEFS, TEXT_ANIM_DEFS, [SIZE, ROUND, SIDES, INNER]]
+  [TRANSFORM_DEFS, THREE_D_DEFS, [CAMERA_DEFS[5], TIME_REMAP_DEF], FILL_DEFS, STROKE_DEFS, TRIM_DEFS, TEXT_DEFS, TEXT_ANIM_DEFS, [SIZE, ROUND, SIDES, INNER]]
     .flat()
     .map((d) => [d.key, d]),
 );
@@ -191,7 +223,7 @@ export function createEffect(type: string): Effect {
 
 function nextName(project: Project, base: string): string {
   let n = 1;
-  const names = new Set(project.layers.map((l) => l.name));
+  const names = new Set(allLayers(project).map((l) => l.name));
   while (names.has(`${base} ${n}`)) n++;
   return `${base} ${n}`;
 }
@@ -260,11 +292,27 @@ export function createLayer(project: Project, type: LayerType, opts: NewLayerOpt
     case 'null':
       base.name = nextName(project, 'Null');
       break;
+    case 'group':
+      base.name = nextName(project, 'Group');
+      base.children = [];
+      break;
+    case 'camera': {
+      const zoom = defaultZoom(project);
+      base.name = nextName(project, 'Camera');
+      base.props.z = { value: -zoom };
+      base.props.zoom = { value: zoom };
+      break;
+    }
     case 'adjustment':
       base.name = nextName(project, 'Adjustment');
       break;
   }
   return { ...base, ...rest, props: { ...base.props, ...(rest.props ?? {}) } };
+}
+
+/** Default camera focal length (in pixels), roughly a 50 mm lens. */
+export function defaultZoom(project: { width: number; height: number }) {
+  return Math.round(Math.max(project.width, project.height) * 1.39);
 }
 
 export const PROJECT_PRESETS: { label: string; w: number; h: number }[] = [

@@ -20,9 +20,29 @@ if (!isNative && 'serviceWorker' in navigator && location.protocol === 'https:')
 
 // Test/automation hook: open the app with ?debug to reach the editor state from the console.
 if (location.search.includes('debug')) {
-  void Promise.all([import('./state/store'), import('./model/effectDefs'), import('./engine/renderer'), import('./model/schema'), import('./engine/media'), import('./engine/gl')]).then(
-    ([store, fx, renderer, schema, media, gl]) => {
-      (window as unknown as Record<string, unknown>).__xm = { ...store, EFFECT_LIST: fx.EFFECT_LIST, Renderer: renderer.Renderer, schema, media: media.media, glfx: gl.glfx };
+  void Promise.all([
+    import('./state/store'),
+    import('./model/effectDefs'),
+    import('./engine/renderer'),
+    import('./model/schema'),
+    import('./engine/media'),
+    import('./engine/gl'),
+    import('./engine/transform'),
+    import('./model/tree'),
+    import('./engine/camera'),
+  ]).then(
+    ([store, fx, renderer, schema, media, gl, transform, tree, camera]) => {
+      (window as unknown as Record<string, unknown>).__xm = {
+        ...store,
+        EFFECT_LIST: fx.EFFECT_LIST,
+        Renderer: renderer.Renderer,
+        schema,
+        media: media.media,
+        glfx: gl.glfx,
+        transform,
+        tree,
+        camera,
+      };
     },
   );
 }
