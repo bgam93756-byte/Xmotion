@@ -15,6 +15,8 @@ export interface PropDef {
   unit?: string;
   /** Show a slider (only for bounded numbers). */
   slider?: boolean;
+  /** Discrete choices: the value is the option index. */
+  options?: string[];
 }
 
 export interface PropSection {

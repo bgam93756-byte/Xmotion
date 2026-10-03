@@ -138,7 +138,7 @@ export function buildShape(p: ShapeParams): ShapeGeom {
     }
     case 'ellipse': {
       // Start at the top so trim paths animate like a clock hand.
-      path.ellipse(0, 0, w / 2, h / 2, -Math.PI / 2, 0, Math.PI * 2);
+      path.ellipse(0, 0, w / 2, h / 2, 0, -Math.PI / 2, Math.PI * 1.5);
       const a = w / 2;
       const b = h / 2;
       length = Math.PI * (3 * (a + b) - Math.sqrt((3 * a + b) * (a + 3 * b)));
@@ -217,4 +217,70 @@ export function simplify(points: Vec2[], tolerance = 1.5): Vec2[] {
     }
   }
   return points.filter((_, i) => keep[i]);
+}
+
+/**
+ * Dense polyline along a shape's outline (local coordinates), following the
+ * same geometry as buildShape. Closed outlines end where they start.
+ */
+export function outlinePoints(p: ShapeParams): Vec2[] {
+  const w = Math.max(0, p.w);
+  const h = Math.max(0, p.h);
+  const out: Vec2[] = [];
+  switch (p.kind) {
+    case 'rect': {
+      const r = Math.max(0, Math.min(p.radius, w / 2, h / 2));
+      const x0 = -w / 2;
+      const y0 = -h / 2;
+      const corner = (cx: number, cy: number, a0: number) => {
+        for (let i = 0; i <= 8; i++) {
+          const a = a0 + (i / 8) * (Math.PI / 2);
+          out.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
+        }
+      };
+      if (r > 0) {
+        corner(x0 + w - r, y0 + r, -Math.PI / 2);
+        corner(x0 + w - r, y0 + h - r, 0);
+        corner(x0 + r, y0 + h - r, Math.PI / 2);
+        corner(x0 + r, y0 + r, Math.PI);
+      } else {
+        out.push([x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h]);
+      }
+      out.push(out[0]);
+      break;
+    }
+    case 'ellipse':
+      for (let i = 0; i <= 120; i++) {
+        const a = -Math.PI / 2 + (i / 120) * Math.PI * 2;
+        out.push([(Math.cos(a) * w) / 2, (Math.sin(a) * h) / 2]);
+      }
+      break;
+    case 'polygon':
+    case 'star': {
+      const v = polyVerts(p);
+      out.push(...v, v[0]);
+      break;
+    }
+    case 'path': {
+      const pts = p.points ?? [];
+      if (pts.length < 3) out.push(...pts);
+      else {
+        out.push(pts[0]);
+        let prev: Vec2 = pts[0];
+        for (let i = 1; i < pts.length - 1; i++) {
+          const end: Vec2 = [(pts[i][0] + pts[i + 1][0]) / 2, (pts[i][1] + pts[i + 1][1]) / 2];
+          for (let k = 1; k <= 6; k++) {
+            const t = k / 6;
+            const u = 1 - t;
+            out.push([u * u * prev[0] + 2 * u * t * pts[i][0] + t * t * end[0], u * u * prev[1] + 2 * u * t * pts[i][1] + t * t * end[1]]);
+          }
+          prev = end;
+        }
+        out.push(pts[pts.length - 1]);
+      }
+      if (p.closed && out.length > 1) out.push(out[0]);
+      break;
+    }
+  }
+  return out;
 }

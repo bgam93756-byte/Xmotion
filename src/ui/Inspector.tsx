@@ -1,8 +1,10 @@
 import { useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { BlendMode, EaseName, Layer, Project, PropValue, ShapeKind, TextAnimator, TextAnimUnit, Vec2 } from '../model/types';
 import { evalPropAt, keyAt } from '../model/animate';
 import { EASE_LABELS, applyEase, bezierFor } from '../model/easing';
 import { EFFECT_DEFS, EFFECT_LIST } from '../model/effectDefs';
+import { CATEGORIES as EFFECT_CATEGORIES } from '../effects';
 import { validateExpr } from '../model/expr';
 import { ANIM_PRESETS } from '../model/presets';
 import { PROJECT_PRESETS, getProp, propSections, type PropDef } from '../model/schema';
@@ -462,6 +464,14 @@ export function PropRow({ project, layer, path, def }: { project: Project; layer
 
 function ValueEditor({ def, value, onChange }: { def: PropDef; value: PropValue; onChange: (v: PropValue) => void }) {
   const [linked, setLinked] = useState(def.key === 'scale');
+  if (def.options)
+    return (
+      <Select
+        value={String(Math.round(value as number))}
+        options={def.options.map((o, i) => ({ value: String(i), label: o }))}
+        onChange={(v) => onChange(Number(v))}
+      />
+    );
   if (def.kind === 'color') return <ColorField value={value as string} onChange={onChange} />;
   if (def.kind === 'vec2') {
     const v = value as Vec2;
@@ -535,26 +545,17 @@ function ExprInput({ value, onChange }: { value: string; onChange: (expr: string
 
 /* ---------------- effects ---------------- */
 
-const CATEGORIES = [...new Set(EFFECT_LIST.map((e) => e.category))];
-
 function EffectsSection({ project, layer }: { project: Project; layer: Layer }) {
+  const [picking, setPicking] = useState(false);
+  const others = project.layers.filter((l) => l.id !== layer.id && l.type !== 'audio');
   const adder = (
-    <select className="select add-fx" value="" onChange={(e) => e.target.value && addEffect(layer.id, e.target.value)} title="Add effect">
-      <option value="">+ Add effect</option>
-      {CATEGORIES.map((c) => (
-        <optgroup key={c} label={c}>
-          {EFFECT_LIST.filter((e) => e.category === c).map((e) => (
-            <option key={e.type} value={e.type}>
-              {e.label}
-            </option>
-          ))}
-        </optgroup>
-      ))}
-    </select>
+    <button type="button" className="btn small add-fx" onClick={() => setPicking(true)}>
+      <Icon name="plus" size={14} /> Add effect
+    </button>
   );
   return (
     <Section title={`Effects${layer.effects.length ? ` (${layer.effects.length})` : ''}`} id="effects" right={adder}>
-      {!layer.effects.length && <p className="hint">30 GPU effects: glow, blur, chroma key, glitch, wave, kaleidoscope… Stack as many as you like.</p>}
+      {!layer.effects.length && <p className="hint">{EFFECT_LIST.length} effects: glow, blur, chroma key, 3D shapes, glitch, repeaters, generators… Stack as many as you like.</p>}
       {layer.effects.map((e, i) => {
         const def = EFFECT_DEFS[e.type];
         if (!def) return null;
@@ -567,18 +568,131 @@ function EffectsSection({ project, layer }: { project: Project; layer: Layer }) 
           <div key={e.id} className={`fx-card ${e.enabled ? '' : 'off'}`}>
             <div className="fx-head">
               <Toggle on={e.enabled} onChange={(v) => patchFx((l) => void (l.effects[i].enabled = v))} />
-              <span className="fx-name">{def.label}</span>
+              <span className="fx-name" title={def.description}>
+                {def.label}
+                <small>{def.category}</small>
+              </span>
               <IconButton icon="up" size={14} title="Move up" disabled={i === 0} onClick={() => patchFx((l) => void l.effects.splice(i - 1, 0, l.effects.splice(i, 1)[0]))} />
               <IconButton icon="down" size={14} title="Move down" disabled={i === layer.effects.length - 1} onClick={() => patchFx((l) => void l.effects.splice(i + 1, 0, l.effects.splice(i, 1)[0]))} />
               <IconButton icon="trash" size={14} title="Remove effect" onClick={() => patchFx((l) => void l.effects.splice(i, 1))} />
             </div>
+            {def.refs?.map((r) => (
+              <div key={r.key} className="row">
+                <span className="row-label" title={r.hint}>
+                  {r.label}
+                </span>
+                <Select
+                  value={e.refs?.[r.key] ?? ''}
+                  options={[{ value: '', label: r.hint?.includes('Default') ? 'Default' : 'None' }, ...others.map((l) => ({ value: l.id, label: l.name }))]}
+                  onChange={(v) =>
+                    patchFx((l) => {
+                      const fx = l.effects[i];
+                      fx.refs = { ...(fx.refs ?? {}) };
+                      if (v) fx.refs[r.key] = v;
+                      else delete fx.refs[r.key];
+                    })
+                  }
+                />
+              </div>
+            ))}
             {def.props.map((d) => (
               <PropRow key={d.key} project={project} layer={layer} path={`fx.${e.id}.${d.key}`} def={d} />
             ))}
           </div>
         );
       })}
+      {picking && (
+        <EffectPicker
+          layer={layer}
+          onPick={(type) => {
+            addEffect(layer.id, type);
+            setPicking(false);
+          }}
+          onClose={() => setPicking(false)}
+        />
+      )}
     </Section>
+  );
+}
+
+const RECENT_KEY = 'xm.recentFx';
+function recentFx(): string[] {
+  try {
+    return JSON.parse(localStorage.getItem(RECENT_KEY) ?? '[]');
+  } catch {
+    return [];
+  }
+}
+
+/** Full-screen searchable list of every effect, grouped by category. */
+function EffectPicker({ layer, onPick, onClose }: { layer: Layer; onPick: (type: string) => void; onClose: () => void }) {
+  const [q, setQ] = useState('');
+  const [cat, setCat] = useState<string>('All');
+  const query = q.trim().toLowerCase();
+  const fits = (d: (typeof EFFECT_LIST)[number]) => (d.category !== 'Text' || layer.type === 'text' || d.type === 'countUpDown' || d.type === 'timecode') && (d.category !== 'Shape' || layer.type === 'shape' || layer.type === 'text');
+  const list = EFFECT_LIST.filter((d) => fits(d) && (cat === 'All' || d.category === cat) && (!query || d.label.toLowerCase().includes(query) || d.description.toLowerCase().includes(query) || d.category.toLowerCase().includes(query)));
+  const recent = recentFx()
+    .map((t) => EFFECT_DEFS[t])
+    .filter((d) => d && fits(d));
+  const pick = (type: string) => {
+    try {
+      localStorage.setItem(RECENT_KEY, JSON.stringify([type, ...recentFx().filter((t) => t !== type)].slice(0, 8)));
+    } catch {
+      /* storage unavailable */
+    }
+    onPick(type);
+  };
+  const groups = cat === 'All' && !query ? EFFECT_CATEGORIES.filter((c) => list.some((d) => d.category === c)) : [null];
+  // Portal: the docked properties sheet is transformed, which would trap a fixed overlay.
+  return createPortal(
+    <div className="sheet-layer modal fx-picker" onPointerDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="sheet" role="dialog" aria-label="Add effect">
+        <div className="sheet-head">
+          <span className="sheet-grip" />
+          <span className="sheet-title">Add effect · {EFFECT_LIST.length}</span>
+          <IconButton icon="close" title="Close" onClick={onClose} />
+        </div>
+        <div className="fx-search">
+          <input autoFocus className="text-input" placeholder="Search effects (glow, 3D, glitch, key…)" value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.stopPropagation()} />
+          <div className="chips scroll">
+            {['All', ...EFFECT_CATEGORIES].map((c) => (
+              <button key={c} type="button" className={`chip ${cat === c ? 'on' : ''}`} onClick={() => setCat(c)}>
+                {c}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="sheet-body fx-list">
+          {!query && cat === 'All' && recent.length > 0 && (
+            <>
+              <h4>Recent</h4>
+              <div className="chips">
+                {recent.map((d) => (
+                  <button key={d.type} type="button" className="chip" onClick={() => pick(d.type)}>
+                    {d.label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+          {groups.map((g) => (
+            <div key={g ?? 'results'}>
+              {g && <h4>{g}</h4>}
+              {list
+                .filter((d) => !g || d.category === g)
+                .map((d) => (
+                  <button key={d.type} type="button" className="fx-item" onClick={() => pick(d.type)}>
+                    <b>{d.label}</b>
+                    <span>{d.description}</span>
+                  </button>
+                ))}
+            </div>
+          ))}
+          {!list.length && <p className="hint">No effects match “{q}”.</p>}
+        </div>
+      </div>
+    </div>,
+    document.body,
   );
 }
 

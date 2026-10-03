@@ -66,6 +66,8 @@ export interface Effect {
   type: string;
   enabled: boolean;
   props: Record<string, Prop>;
+  /** Referenced layers by key (e.g. a displacement map or a path). */
+  refs?: Record<string, string>;
 }
 
 export interface Layer {

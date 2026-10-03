@@ -1,4 +1,4 @@
-import type { Layer } from '../model/types';
+import type { Layer, TextAnimator, TextAnimUnit } from '../model/types';
 import { applyEase } from '../model/easing';
 import { hash1 } from '../model/noise';
 import { ensureFont, fontCss } from './fonts';
@@ -93,6 +93,11 @@ export interface TextPaint {
   waveFreq: number;
   time: number;
   fontSize: number;
+  /** Overrides from text effects. */
+  animator?: TextAnimator;
+  unit?: TextAnimUnit;
+  random?: { amount: number; speed: number };
+  glyph?: (index: number, count: number) => { dx: number; dy: number; rot: number; scale: number; alpha: number };
 }
 
 const SCRAMBLE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$%&@*+=?';
@@ -104,7 +109,7 @@ export function drawText(ctx: CanvasRenderingContext2D, layer: Layer, layout: Te
   ctx.textBaseline = 'middle';
   ctx.lineJoin = 'round';
   ctx.miterLimit = 2;
-  const anim = layer.animator ?? 'none';
+  const anim = p.animator ?? layer.animator ?? 'none';
   const reveal = Math.min(1, Math.max(0, p.reveal / 100));
   const hasStroke = !!p.stroke && p.strokeWidth > 0;
   if (hasStroke) {
@@ -113,7 +118,7 @@ export function drawText(ctx: CanvasRenderingContext2D, layer: Layer, layout: Te
   }
   if (p.fill) ctx.fillStyle = p.fill;
 
-  const simple = anim === 'none' && reveal >= 1 && p.waveAmp === 0;
+  const simple = anim === 'none' && reveal >= 1 && p.waveAmp === 0 && !p.random && !p.glyph;
   if (simple && layout.glyphs.every((g, i, arr) => i === 0 || g.line !== arr[i - 1].line || Math.abs(g.x - (arr[i - 1].x + arr[i - 1].w)) < 0.01)) {
     // Fast path keeps the font's kerning and ligatures intact.
     for (const l of layout.lines) {
@@ -123,7 +128,7 @@ export function drawText(ctx: CanvasRenderingContext2D, layer: Layer, layout: Te
     return;
   }
 
-  const unit = layer.animUnit ?? 'char';
+  const unit = p.unit ?? layer.animUnit ?? 'char';
   const N = layout.counts[unit];
   const soft = anim === 'typewriter' || anim === 'scramble' ? 1 : Math.max(1, Math.min(4, N * 0.35));
   const baseAlpha = ctx.globalAlpha;
@@ -167,10 +172,24 @@ export function drawText(ctx: CanvasRenderingContext2D, layer: Layer, layout: Te
       default:
         alpha = u;
     }
-    if (alpha <= 0.001 || scale <= 0.001) continue;
+    if (p.random && p.random.amount > 0 && hash1(g.char * 7.31 + Math.floor(p.time * p.random.speed) * 0.37) < p.random.amount) {
+      ch = SCRAMBLE[Math.floor(hash1(g.char * 3.7 + Math.floor(p.time * p.random.speed)) * SCRAMBLE.length)];
+    }
+    let dx = 0;
+    let rot = 0;
+    if (p.glyph) {
+      const gt = p.glyph(g.char, layout.counts.char);
+      dx += gt.dx;
+      dy += gt.dy;
+      rot = gt.rot;
+      scale *= gt.scale;
+      alpha *= gt.alpha;
+    }
+    if (alpha <= 0.001 || Math.abs(scale) <= 0.001) continue;
     if (p.waveAmp) dy += Math.sin(p.time * p.waveFreq + g.char * 0.55) * p.waveAmp;
     ctx.save();
-    ctx.translate(g.x + g.w / 2, g.y + dy);
+    ctx.translate(g.x + g.w / 2 + dx, g.y + dy);
+    if (rot) ctx.rotate((rot * Math.PI) / 180);
     if (scale !== 1) ctx.scale(scale, scale);
     ctx.globalAlpha = baseAlpha * alpha;
     if (blur > 0.3 && !supportsFilter) {

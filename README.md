@@ -9,12 +9,24 @@ A keyframe motion-graphics and video editor for **iPhone and iPad** (also runs i
 - **Easing:** 10 easing presets (back, elastic, bounce, hold and more) plus a draggable bézier curve editor.
 - **Motion paths:** shown on the canvas for animated positions.
 - **Expressions (sandboxed):** `wiggle(2, 30)`, `value + time*90`, `loop()`, `pingpong()`, `random()`, `linear()`, vector math and conditions. Project files can't run arbitrary code.
-- **31 effects (30 WebGL shaders plus camera shake):**
-  - Blur & light: Gaussian, directional, zoom, glow, drop shadow, outline/sticker
-  - Color: color adjust, tint, duotone, fill, invert, posterize, threshold
-  - Keying: chroma key (green screen), luma key
-  - Distort: pixelate, wave, swirl, bulge, kaleidoscope, mirror, turbulence, motion tile
-  - Stylize: RGB split, glitch, film grain, scanlines/CRT, vignette, halftone, sketch, camera shake
+- **175 effects, covering every effect in Alight Motion's A–Z list** (all 169 names), plus Drop Shadow, Outline, Duotone, Glitch, Scanlines and Color Adjust.
+  - Every effect parameter can be keyframed or driven by an expression.
+  - A searchable picker groups them into 13 categories:
+    - Blur & Sharpen (Gaussian, lens, spin, unsharp mask, per-layer motion blur…)
+    - Glow & Light (glow, lens flare, lightning, rays, bevel, long shadow, frosted glass…)
+    - Color (gradient map, palette map, channel remap, spot color, iridescence…)
+    - Keying & Matte (chroma key, luma key, matte choker…)
+    - Distort (curl, displacement map, polar coordinates, tunnel, wave warp…)
+    - Generate (checker, clouds, starfield, voronoi, contour lines, heart, star…)
+    - Stylize (CMYK halftone, mosaic, block noise…)
+    - Tiles & Repeat (hexagon tilings, linear/radial/grid/scatter repeat, repeat along a path)
+    - Transition (dissolve, radial wipe…)
+    - 3D & Perspective (box, cube, cylinder, torus, pyramid and more, raymarched on the GPU with the layer mapped onto them, plus 360° viewer/reorient)
+    - Motion (oscillate, swing, jitter, echo keyframes, time quantization, move along a path…)
+    - Text (progress, randomizer, transform, count up/down, timecode)
+    - Shape (drawing progress, stroke color, stroke taper)
+  - Effects such as Displacement Map, Move Along Path and Repeat Along Path take another layer as their map or path.
+  - The implementations are Xmotion's own. They are named after the matching Alight Motion effects and do the same job, but their controls and exact looks differ.
 - **Text animators:** typewriter, fade, pop, slide up, drop and bounce, decode/scramble, and blur-in. Each works per letter, word or line. Text also has a wave option, 20 Google Fonts, and custom font import (.ttf/.otf/.woff).
 - **Shapes:** trim paths (draw-on strokes), rounded corners, and linear/radial gradients.
 - **Compositing:** 17 blend modes, clipping masks ("clip to layer below"), and parenting.
@@ -92,4 +104,5 @@ npm run build      # typecheck + production build into dist/
 
 - The iOS app requires **iOS 16.4 or later** (the first iOS with WebCodecs video encoding). On older Safari versions without a native AAC encoder, a bundled WASM AAC encoder is loaded automatically so exports still have sound.
 - Google Fonts download on first use; offline, text falls back to the system font until the font has been cached.
-- There are no 3D layers or shape masks yet. Clipping masks and keying cover most masking needs for now.
+- There are no true 3D layers or cameras yet; the 3D effects render the layer onto 3D objects. There are no shape masks either; clipping masks, mattes and keying cover most masking needs.
+- Effects run on the GPU at preview resolution. Stacking many heavy effects (3D objects, lens blur) on 4K comps will lower the preview frame rate on older phones, but exports are always rendered at full quality.
