@@ -7,7 +7,7 @@ import type { Layer, Project, Vec2 } from '../model/types';
 import { num } from '../model/animate';
 import { defaultZoom } from '../model/schema';
 import { walk } from '../model/tree';
-import { isActive, timesOf, worldMatrix } from './transform';
+import { activeAt, timesOf, worldMatrix } from './transform';
 
 export interface Camera {
   /** World → camera space. */
@@ -29,8 +29,7 @@ export const NEAR = 1;
 export function activeCamera(project: Project, compT: number): Camera {
   let cam: Layer | null = null;
   walk(project.layers, (l) => {
-    if (cam || l.type !== 'camera' || !l.visible) return;
-    if (isActive(l, timesOf(project, l, compT).ct)) cam = l;
+    if (!cam && l.type === 'camera' && activeAt(project, l, compT)) cam = l;
   });
   const cx = project.width / 2;
   const cy = project.height / 2;
@@ -115,14 +114,20 @@ export function depthAt(H: Mat3, u: number, v: number): number {
   return H[6] * u + H[7] * v + H[8];
 }
 
-/** Where a comp-screen point hits a 3D layer's plane, in its local coordinates. */
-export function rayToLayer(project: Project, layer: Layer, p: Vec2, compT: number, cam: Camera): Vec2 | null {
+/** Where a comp-screen point hits a 3D layer's plane: local coordinates and camera depth. */
+export function rayHit(project: Project, layer: Layer, p: Vec2, compT: number, cam: Camera): { u: number; v: number; depth: number } | null {
   const inv = inv3(homography(cam, worldMatrix(project, layer, compT)));
   if (!inv) return null;
   const [u, v, w] = apply3(inv, p[0], p[1]);
   // w = 1 / depth: positive and below 1/NEAR when the hit is in front of the camera.
   if (w <= 0 || w > 1 / NEAR) return null;
-  return [u / w, v / w];
+  return { u: u / w, v: v / w, depth: 1 / w };
+}
+
+/** Where a comp-screen point hits a 3D layer's plane, in its local coordinates. */
+export function rayToLayer(project: Project, layer: Layer, p: Vec2, compT: number, cam: Camera): Vec2 | null {
+  const hit = rayHit(project, layer, p, compT, cam);
+  return hit ? [hit.u, hit.v] : null;
 }
 
 /**

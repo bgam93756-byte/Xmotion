@@ -1,10 +1,9 @@
 /** Elements: layers saved to a library on the device, reusable in any project. */
 import type { Layer } from '../model/types';
-import { allLayers, isInside } from '../model/tree';
 import { uid } from '../model/ids';
 import { thumbnail } from '../engine/renderer';
 import { deleteElement, listElements, saveElement, type ElementRecord } from '../engine/storage';
-import { assetsOf, insertClip, selectedIds, toast, useEditor } from './store';
+import { assetsOf, bakeToComp, insertClip, selectedIds, toast, topLevelSelection, useEditor } from './store';
 
 export type { ElementRecord };
 export { listElements, deleteElement };
@@ -21,11 +20,13 @@ export function onElementsChange(fn: () => void) {
 export async function saveAsElement(name?: string, ids = selectedIds()): Promise<ElementRecord | null> {
   const { project, time } = useEditor.getState();
   if (!project) return null;
-  const layers: Layer[] = allLayers(project).filter((l) => ids.includes(l.id) && !ids.some((o) => o !== l.id && isInside(project, l.id, o)));
-  if (!layers.length) {
+  const picked = topLevelSelection(project, ids);
+  if (!picked.length) {
     toast('Select a layer to save as an element');
     return null;
   }
+  // Saved where they show on screen, whatever group or parent they were in.
+  const layers: Layer[] = bakeToComp(project, picked, time);
   let thumb: string | undefined;
   try {
     thumb = thumbnail({ ...project, layers }, Math.min(time, project.duration));
@@ -36,8 +37,8 @@ export async function saveAsElement(name?: string, ids = selectedIds()): Promise
     id: uid('E'),
     name: name?.trim() || layers[0].name,
     created: Date.now(),
-    layers: structuredClone(layers),
-    assets: assetsOf(project, layers),
+    layers,
+    assets: assetsOf(project, picked),
     width: project.width,
     height: project.height,
     thumb,

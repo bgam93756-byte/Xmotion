@@ -7,7 +7,7 @@ import { flat, is3DLayer, isMask, Renderer } from '../engine/renderer';
 import { media } from '../engine/media';
 import { onFontsChanged } from '../engine/fonts';
 import { simplify, type Rect } from '../engine/shapes';
-import { activeAt, apply, corners, hitTest, localBounds, parentMatrix, propClock, timesOf, worldMatrix } from '../engine/transform';
+import { activeAt, apply, corners, hitTest, localBounds, parentMatrix, propClock, timesOf, worldMatrix, withMemo } from '../engine/transform';
 import { activeCamera, homography, projectLocal, projectPoint, rayToLayer, screenDeltaToWorld, type Camera } from '../engine/camera';
 import {
   endMerge,
@@ -231,7 +231,8 @@ export function Viewport() {
       raf.current = 0;
       const full = fullDraw.current;
       fullDraw.current = false;
-      draw(full);
+      // The comp and its overlay share cached matrices for this frame.
+      withMemo(() => draw(full));
     });
   };
 

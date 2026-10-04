@@ -174,3 +174,10 @@
     repeating-linear-gradient(-45deg, rgba(255, 255, 255, 0.12) 0 2px, transparent 2px 8px),
     repeating-linear-gradient(45deg, transparent 0 6px, rgba(0, 0, 0, 0.25) 6px 12px);
 }
+
+/* Keyframes on a time-remapped clock: positions are in the layer's own time. */
+.timeline .diamond.retimed {
+  opacity: 0.6;
+  outline: 1px dashed currentColor;
+  outline-offset: 1px;
+}

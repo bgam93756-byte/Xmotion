@@ -26,6 +26,25 @@ interface AssetRecord {
 
 let dbp: Promise<IDBDatabase> | null = null;
 
+let blocked = false;
+const blockedListeners = new Set<(blocked: boolean) => void>();
+
+/**
+ * Tells when opening storage waits on another tab that still has an older
+ * version open (it must be closed before the upgrade can finish).
+ */
+export function onStorageBlocked(fn: (blocked: boolean) => void): () => void {
+  blockedListeners.add(fn);
+  if (blocked) fn(true);
+  return () => void blockedListeners.delete(fn);
+}
+
+function setBlocked(b: boolean) {
+  if (blocked === b) return;
+  blocked = b;
+  blockedListeners.forEach((fn) => fn(b));
+}
+
 function db(): Promise<IDBDatabase> {
   if (!dbp) {
     dbp = new Promise((res, rej) => {
@@ -36,8 +55,21 @@ function db(): Promise<IDBDatabase> {
         if (!d.objectStoreNames.contains('assets')) d.createObjectStore('assets', { keyPath: 'id' });
         if (!d.objectStoreNames.contains('elements')) d.createObjectStore('elements', { keyPath: 'id' });
       };
-      req.onsuccess = () => res(req.result);
-      req.onerror = () => rej(req.error);
+      req.onblocked = () => setBlocked(true);
+      req.onsuccess = () => {
+        setBlocked(false);
+        const d = req.result;
+        // Let a newer version in another tab upgrade instead of waiting on us.
+        d.onversionchange = () => {
+          d.close();
+          dbp = null;
+        };
+        res(d);
+      };
+      req.onerror = () => {
+        dbp = null;
+        rej(req.error);
+      };
     });
   }
   return dbp;

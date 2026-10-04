@@ -1,13 +1,14 @@
 import { create } from 'zustand';
 import { produce, setAutoFreeze } from 'immer';
-import type { AssetMeta, Bezier, EaseName, Effect, Keyframe, Layer, Project, Prop, PropValue, Vec2 } from '../model/types';
+import type { AssetMeta, Bezier, EaseName, Effect, Layer, Project, Prop, PropValue, Vec2 } from '../model/types';
 import { evalPropAt, keyAt, sortKeys, vec, type EvalContext } from '../model/animate';
 import { cloneValue, createEffect, createLayer, defaultZoom, findDef, getProp, propOwner, type PropKind } from '../model/schema';
-import { allLayers, findLayer, isInside, walk } from '../model/tree';
+import { allLayers, ancestors, findLayer, isInside, walk } from '../model/tree';
 import { uid } from '../model/ids';
 import { audioPlayer } from '../engine/audio';
 import { media } from '../engine/media';
 import { getAsset } from '../engine/storage';
+import { rebase } from './rebase';
 import { corners, ctxFor, isMaskLayer, localBounds, localMatrix, parentMatrix, propClock, timesOf, worldMatrix } from '../engine/transform';
 
 setAutoFreeze(false);
@@ -75,6 +76,20 @@ export interface EditorState {
 }
 
 const MAX_HISTORY = 150;
+
+/**
+ * Pointers currently down. Edits that share a merge key collapse into one undo
+ * step: for a drag (a pointer is down) however long it takes, otherwise when
+ * they come within 1.5 s (slider and keyboard nudges).
+ */
+const pointers = new Set<number>();
+if (typeof window !== 'undefined') {
+  window.addEventListener('pointerdown', (e) => pointers.add(e.pointerId), true);
+  const lift = (e: PointerEvent) => pointers.delete(e.pointerId);
+  window.addEventListener('pointerup', lift, true);
+  window.addEventListener('pointercancel', lift, true);
+  window.addEventListener('blur', () => pointers.clear());
+}
 const CLIP_KEY = 'xm.clipboard';
 const VIEW_KEY = 'xm.view';
 
@@ -179,7 +194,7 @@ export function update(recipe: (p: Project) => void, merge?: string) {
   if (next === project) return;
   next.modified = Date.now();
   const now = performance.now();
-  const merging = !!merge && lastMerge?.key === merge && now - lastMerge.at < 1500;
+  const merging = !!merge && lastMerge?.key === merge && (pointers.size > 0 || now - lastMerge.at < 1500);
   lastMerge = merge ? { key: merge, at: now } : null;
   set({
     project: next,
@@ -194,11 +209,26 @@ export function endMerge() {
   lastMerge = null;
 }
 
+/** Which groups are open is view state: undo/redo keep the current one. */
+function keepCollapsed(target: Project, from: Project): Project {
+  const closed = new Map<string, boolean>();
+  walk(from.layers, (l) => {
+    if (l.type === 'group') closed.set(l.id, !!l.collapsed);
+  });
+  const differs = allLayers(target).some((l) => l.type === 'group' && closed.has(l.id) && !!l.collapsed !== closed.get(l.id));
+  if (!differs) return target;
+  return produce(target, (d) => {
+    walk(d.layers, (l) => {
+      if (l.type === 'group' && closed.has(l.id)) l.collapsed = closed.get(l.id);
+    });
+  });
+}
+
 export function undo() {
   const { past, project, future } = get();
   if (!past.length || !project) return;
   lastMerge = null;
-  const prev = past[past.length - 1];
+  const prev = keepCollapsed(past[past.length - 1], project);
   set({ project: prev, past: past.slice(0, -1), future: [project, ...future], saveState: 'unsaved' });
   fixSelection();
 }
@@ -207,7 +237,7 @@ export function redo() {
   const { past, project, future } = get();
   if (!future.length || !project) return;
   lastMerge = null;
-  set({ project: future[0], past: [...past, project], future: future.slice(1), saveState: 'unsaved' });
+  set({ project: keepCollapsed(future[0], project), past: [...past, project], future: future.slice(1), saveState: 'unsaved' });
   fixSelection();
 }
 
@@ -229,6 +259,7 @@ export function selectedLayer(): Layer | undefined {
 
 export function select(id: string | null) {
   set({ selectedId: id, selection: [], keySel: id === get().keySel?.layerId ? get().keySel : null });
+  reveal(id);
 }
 
 /** Adds or removes a layer from the multi-selection. */
@@ -268,50 +299,73 @@ function containerMatrix(p: Project, groupId: string | null | undefined, t: numb
 
 const round2 = (v: number) => Math.round(v * 100) / 100;
 
-function setStatic(l: Layer, key: string, value: PropValue) {
-  if (getProp(l, key).keys?.length) return;
-  l.props[key] = { ...l.props[key], value };
-}
-
-/**
- * Sets a (draft) layer's transform so that it keeps the world matrix `world`
- * under a new parent space `parentM`. Animated properties are left alone.
- */
-function placeAt(l: Layer, world: DOMMatrix, parentM: DOMMatrix, lt: number, ec: EvalContext) {
-  const local = parentM.inverse().multiply(world);
-  if (Number.isNaN(local.a)) return;
-  const [ax, ay] = vec(l, 'anchor', lt, ec);
-  const pos = local.transformPoint(new DOMPoint(ax, ay, 0));
-  setStatic(l, 'position', [round2(pos.x), round2(pos.y)]);
-  if (l.threeD) {
-    setStatic(l, 'z', round2(pos.z));
-    return;
-  }
-  const sx = Math.hypot(local.a, local.b);
-  if (sx < 1e-9) return;
-  const det = local.a * local.d - local.b * local.c;
-  setStatic(l, 'rotation', round2((Math.atan2(local.b, local.a) * 180) / Math.PI));
-  setStatic(l, 'scale', [round2(sx * 100), round2((det / sx) * 100)]);
-}
-
-/** World matrices and clocks of layers before a structural change (to keep them in place after). */
+/** Parent spaces and clocks of layers before a structural change (to keep them in place after). */
 function snapshot(p: Project, ids: Iterable<string>, t: number) {
-  const out = new Map<string, { world: DOMMatrix; lt: number; ec: EvalContext }>();
+  const out = new Map<string, { parent: DOMMatrix; lt: number; ec: EvalContext }>();
   for (const id of ids) {
     const l = layerById(p, id);
     if (!l) continue;
     const { ec, lt } = timesOf(p, l, t);
-    out.set(id, { world: worldMatrix(p, l, t), lt, ec });
+    out.set(id, { parent: parentMatrix(p, l, t), lt, ec });
   }
   return out;
 }
 
-/** Re-applies snapshotted world transforms on the draft (after the tree changed). */
+const INEXACT = "Some animated layers couldn't be kept exactly in place; check their keyframes";
+
+/** Re-expresses snapshotted layers in their new parent space, on the draft after the tree changed. */
 function restore(d: Project, snap: ReturnType<typeof snapshot>, t: number) {
+  let exact = true;
   for (const [id, s] of snap) {
     const l = layerById(d, id);
-    if (l) placeAt(l, s.world, parentMatrix(d, l, t), s.lt, s.ec);
+    if (l && !rebase(l, s.parent, parentMatrix(d, l, t), s.lt, s.ec)) exact = false;
   }
+  if (!exact) toast(INEXACT);
+}
+
+/**
+ * Moves a (draft) layer's in point to `start` without moving its content:
+ * keyframes, media trim and time-remap values shift with it.
+ */
+export function shiftInPoint(l: Layer, start: number) {
+  const delta = start - l.start;
+  if (!delta) return;
+  if (l.trimIn !== undefined) l.trimIn = Math.max(0, l.trimIn + delta * (l.speed ?? 1));
+  for (const [key, pr] of Object.entries(l.props)) {
+    // Remap values are seconds after the start, so they shift with it too.
+    const remap = key === 'timeRemap' && !!l.timeRemapOn;
+    pr.keys?.forEach((k) => {
+      k.t -= delta;
+      if (remap) k.v = (k.v as number) - delta;
+    });
+    if (remap && !pr.keys?.length) pr.value = (pr.value as number) - delta;
+  }
+  for (const e of l.effects) for (const pr of Object.values(e.props)) pr.keys?.forEach((k) => (k.t -= delta));
+  l.start = start;
+}
+
+/** Widens a group (and the groups around it) so a layer's time span shows inside it. */
+function coverSpan(d: Project, groupId: string | null, start: number, end: number) {
+  for (let g = groupId ? layerById(d, groupId) : undefined; g && !g.timeRemapOn; g = findLayer(d, g.id)?.group ?? undefined) {
+    if (start < g.start) shiftInPoint(g, start);
+    if (end > g.end) g.end = end;
+  }
+}
+
+/** Opens collapsed groups around a layer so its timeline row shows (not an undo step). */
+function reveal(id: string | null) {
+  const p = get().project;
+  if (!p || !id) return;
+  const closed = ancestors(p, id).filter((g) => g.collapsed);
+  if (!closed.length) return;
+  set({
+    project: produce(p, (d) => {
+      for (const g of closed) {
+        const dg = layerById(d, g.id);
+        if (dg) dg.collapsed = false;
+      }
+    }),
+  });
 }
 
 /** Where new layers go: above the selected layer, in its group. */
@@ -321,29 +375,30 @@ function insertionPoint(p: Project): { group: string | null; index: number } {
 }
 
 /**
- * Inserts layers (top to bottom order) into a container. Layers created in
- * comp coordinates are moved into the group's space so they stay in place.
+ * Inserts layers (top to bottom order) into a container in one undo step.
+ * Layers in comp coordinates (`compSpace`: new layers, the clipboard,
+ * Elements) are re-expressed in the group's space so they stay in place.
  */
-function insertLayers(layers: Layer[], at?: { group: string | null; index: number }, compSpace = true) {
+function insertLayers(layers: Layer[], at?: { group: string | null; index: number }, compSpace = true, assets: AssetMeta[] = []) {
   const { project, time } = get();
   if (!project || !layers.length) return;
   const target = at ?? insertionPoint(project);
-  const inv = compSpace && target.group ? containerMatrix(project, target.group, time).inverse() : null;
+  const space = compSpace && target.group ? containerMatrix(project, target.group, time) : null;
+  let exact = true;
   update((p) => {
+    for (const a of assets) if (!p.assets.some((x) => x.id === a.id)) p.assets.push(a);
     const list = listOf(p, target.group);
     const siblings = new Set(list.map((l) => l.id).concat(layers.map((l) => l.id)));
     for (const l of layers) {
       if (l.parent && !siblings.has(l.parent)) l.parent = null;
-      if (inv && !Number.isNaN(inv.a) && !l.parent && !getProp(l, 'position').keys?.length) {
-        const [x, y] = getProp(l, 'position').value as Vec2;
-        const q = inv.transformPoint(new DOMPoint(x, y));
-        l.props.position = { ...l.props.position, value: [round2(q.x), round2(q.y)] };
-      }
+      if (space && !l.parent && !rebase(l, new DOMMatrix(), space, time, { project, index: 1 })) exact = false;
     }
     list.splice(Math.max(0, Math.min(list.length, target.index)), 0, ...layers);
   });
+  if (!exact) toast(INEXACT);
   const ids = layers.map((l) => l.id);
   set({ selectedId: ids[0], selection: ids.length > 1 ? ids : [], keySel: null });
+  reveal(ids[0]);
 }
 
 /** Adds a layer above the selected one (or at `at`). */
@@ -387,13 +442,14 @@ export function deleteLayers(ids: string[]) {
     time,
   );
   update((d) => {
-    const prune = (list: Layer[]): Layer[] =>
-      list.filter((l) => {
-        if (gone.has(l.id)) return false;
-        if (l.children) l.children = prune(l.children);
-        return true;
-      });
-    d.layers = prune(d.layers);
+    // Splice in place so the lists stay drafts.
+    const prune = (list: Layer[]) => {
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (gone.has(list[i].id)) list.splice(i, 1);
+        else if (list[i].children) prune(list[i].children!);
+      }
+    };
+    prune(d.layers);
     walk(d.layers, (l) => {
       if (l.parent && gone.has(l.parent)) l.parent = null;
     });
@@ -471,6 +527,8 @@ export function moveLayerTo(id: string, groupId: string | null, index: number) {
     l.parent = null;
     const list = listOf(d, groupId);
     list.splice(Math.max(0, Math.min(list.length, index)), 0, l);
+    // A group only shows its children inside its own time span.
+    coverSpan(d, groupId, l.start, l.end);
     restore(d, snap, time);
   });
 }
@@ -535,20 +593,27 @@ export function ungroup(id: string) {
   if (!p || !f || f.layer.type !== 'group') return;
   const g = f.layer;
   const kids = g.children ?? [];
-  if (g.effects.length || g.timeRemapOn || getProp(g, 'opacity').keys?.length || (getProp(g, 'opacity').value as number) < 100 || isMaskLayer(g))
-    toast("The group's opacity, effects, mask and time remapping were removed");
-  const snap = snapshot(
-    p,
-    kids.filter((k) => !k.parent).map((k) => k.id),
-    time,
-  );
+  const lost: string[] = [];
+  if ((getProp(g, 'opacity').value as number) < 100 || getProp(g, 'opacity').keys?.length) lost.push('opacity');
+  if (g.effects.length) lost.push('effects');
+  if (isMaskLayer(g)) lost.push('mask');
+  if (g.timeRemapOn) lost.push('time remapping');
+  if (['position', 'rotation', 'scale', 'anchor', 'skew', 'skewAxis'].some((k) => getProp(g, k).keys?.length)) lost.push('animation (layers keep the pose at the playhead)');
+  if (lost.length) toast(`Removed the group's ${lost.join(', ')}`);
+  // Layers parented to the group lose their parent; they stay in place too.
+  const parented = f.list.filter((l) => l.parent === id);
+  const snap = snapshot(p, [...kids.filter((k) => !k.parent).map((k) => k.id), ...parented.map((l) => l.id)], time);
   update((d) => {
     const at = findLayer(d, id)!;
     const children = at.layer.children ?? [];
-    for (const c of children) {
-      c.start = Math.max(c.start, Math.min(g.start, c.end - 0.1));
-      c.end = Math.min(c.end, Math.max(g.end, c.start + 0.1));
-    }
+    // The group only showed its children inside its own span (on the comp clock unless remapped).
+    if (!g.timeRemapOn)
+      for (const c of children) {
+        const start = Math.min(g.start, c.end - 0.1);
+        if (c.start < start) shiftInPoint(c, start);
+        c.end = Math.min(c.end, Math.max(g.end, c.start + 0.1));
+      }
+    for (const l of at.list) if (l.parent === id) l.parent = null;
     at.list.splice(at.index, 1, ...children);
     restore(d, snap, time);
   });
@@ -564,15 +629,8 @@ export function splitLayer(id: string) {
     toast('Move the playhead inside the clip to split it');
     return;
   }
-  const delta = ct - l.start;
   const [second] = cloneLayers([l], '');
-  second.start = ct;
-  if (second.trimIn !== undefined) second.trimIn = (l.trimIn ?? 0) + delta * (l.speed ?? 1);
-  const shift = (props: Record<string, { keys?: Keyframe[] }>) => {
-    for (const pr of Object.values(props)) pr.keys?.forEach((k) => (k.t -= delta));
-  };
-  shift(second.props);
-  second.effects.forEach((e) => shift(e.props));
+  shiftInPoint(second, ct);
   update((d) => {
     const f = findLayer(d, id)!;
     f.layer.end = ct;
@@ -594,13 +652,38 @@ export function assetsOf(p: Project, layers: Layer[]): AssetMeta[] {
   return p.assets.filter((a) => ids.has(a.id) || (a.kind === 'font' && !!a.fontFamily && fonts.has(a.fontFamily)));
 }
 
+/**
+ * Copies of layers in comp space: each one not parented inside the set gets its
+ * parent's or group's transform baked in, so it lands where it was seen
+ * (used by the clipboard and Elements).
+ */
+export function bakeToComp(p: Project, layers: Layer[], t: number): Layer[] {
+  const ids = new Set(layers.map((l) => l.id));
+  let exact = true;
+  const out = layers.map((l) => {
+    const c = structuredClone(l);
+    if (c.parent && ids.has(c.parent)) return c;
+    const { ec, lt } = timesOf(p, l, t);
+    if (!rebase(c, parentMatrix(p, l, t), new DOMMatrix(), lt, ec)) exact = false;
+    c.parent = null;
+    return c;
+  });
+  if (!exact) toast(INEXACT);
+  return out;
+}
+
+/** The selected layers worth copying: top to bottom, without layers already inside a selected group. */
+export function topLevelSelection(p: Project, ids: string[]): Layer[] {
+  return allLayers(p).filter((l) => ids.includes(l.id) && !ids.some((o) => o !== l.id && isInside(p, l.id, o)));
+}
+
 /** Copies layers (top to bottom); they can be pasted into any project. */
 export function copyLayers(ids = selectedIds()) {
-  const p = get().project;
+  const { project: p, time } = get();
   if (!p) return;
-  const layers = allLayers(p).filter((l) => ids.includes(l.id) && !ids.some((o) => o !== l.id && isInside(p, l.id, o)));
+  const layers = topLevelSelection(p, ids);
   if (!layers.length) return;
-  const clip: LayerClip = { layers: structuredClone(layers), assets: assetsOf(p, layers) };
+  const clip: LayerClip = { layers: bakeToComp(p, layers, time), assets: assetsOf(p, layers) };
   set({ clipboard: clip });
   try {
     localStorage.setItem(CLIP_KEY, JSON.stringify(clip));
@@ -614,36 +697,31 @@ export function copyLayer(id: string) {
   copyLayers([id]);
 }
 
-/** Makes sure a project lists (and the registry has loaded) the given assets. */
-export async function ensureAssets(assets: AssetMeta[]): Promise<boolean> {
+/** Loads assets into the media registry (from this device's storage); false if some are missing. */
+export async function loadAssets(assets: AssetMeta[]): Promise<boolean> {
   let ok = true;
-  const missing: AssetMeta[] = [];
   for (const a of assets) {
-    if (!media.has(a.id)) {
-      const rec = await getAsset(a.id);
-      if (rec) await media.register(rec.meta, rec.blob);
-      else ok = false;
-    }
-    if (!get().project?.assets.some((x) => x.id === a.id)) missing.push(a);
+    if (media.has(a.id)) continue;
+    const rec = await getAsset(a.id);
+    if (rec) await media.register(rec.meta, rec.blob);
+    else ok = false;
   }
-  if (missing.length)
-    update((d) => {
-      for (const a of missing) if (!d.assets.some((x) => x.id === a.id)) d.assets.push(a);
-    });
   return ok;
 }
 
-/** Inserts copied layers (or an element) above the selection. */
+/** Inserts copied layers (or an element, both in comp space) above the selection. */
 export async function insertClip(clip: LayerClip) {
   if (!get().project) return;
-  if (!(await ensureAssets(clip.assets))) toast('Some media is missing on this device');
+  if (!(await loadAssets(clip.assets))) toast('Some media is missing on this device');
   const p = get().project;
   if (!p) return;
   const layers = cloneLayers(clip.layers, '');
+  const pasted = new Set<string>();
+  walk(layers, (l) => void pasted.add(l.id));
   walk(layers, (l) => {
-    for (const e of l.effects) for (const k in e.refs ?? {}) if (!findLayer(p, e.refs![k]) && !layers.some((x) => x.id === e.refs![k])) delete e.refs![k];
+    for (const e of l.effects) for (const k in e.refs ?? {}) if (!pasted.has(e.refs![k]) && !findLayer(p, e.refs![k])) delete e.refs![k];
   });
-  insertLayers(layers, undefined, false);
+  insertLayers(layers, undefined, true, clip.assets);
 }
 
 export function pasteLayer() {

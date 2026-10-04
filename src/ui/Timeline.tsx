@@ -16,6 +16,7 @@ import {
   select,
   setCollapsed,
   setTime,
+  shiftInPoint,
   stop,
   toggleSelect,
   update,
@@ -112,22 +113,6 @@ function animatedPaths(l: Layer): { path: string; label: string; keys: Keyframe[
  * Moves a (draft) layer's in point to `ns` while its content stays where it is
  * in time: media trim, keyframes (relative to start) and time remapping compensate.
  */
-function setInPoint(l: Layer, ns: number) {
-  const delta = ns - l.start;
-  if (l.trimIn !== undefined) l.trimIn = Math.max(0, l.trimIn + delta * (l.speed ?? 1));
-  for (const [key, pr] of Object.entries(l.props)) {
-    // Remap values are seconds after the start, so they shift with it too.
-    const remap = key === 'timeRemap' && !!l.timeRemapOn;
-    pr.keys?.forEach((k) => {
-      k.t -= delta;
-      if (remap) k.v = (k.v as number) - delta;
-    });
-    if (remap && !pr.keys?.length) pr.value = (pr.value as number) - delta;
-  }
-  for (const e of l.effects) for (const pr of Object.values(e.props)) pr.keys?.forEach((k) => (k.t -= delta));
-  l.start = ns;
-}
-
 interface RowGestures {
   down(e: React.PointerEvent, id: string): void;
   move(e: React.PointerEvent): void;
@@ -315,6 +300,9 @@ function useRowGestures(scrollRef: { current: HTMLDivElement | null }, rowsRef: 
   return { ...api, reorder };
 }
 
+/** Vertical scroll of the layer list, kept while the timeline is unmounted. */
+let savedScrollTop = 0;
+
 export function Timeline() {
   const project = useEditor((s) => s.project)!;
   const selectedId = useEditor((s) => s.selectedId);
@@ -327,9 +315,10 @@ export function Timeline() {
   const pinch = useRef<{ d0: number; z0: number } | null>(null);
   const touches = useRef(new Map<number, number>());
 
-  const NW = width < 700 ? 136 : 196;
+  const compact = width < 700;
+  const NW = compact ? 150 : 196;
   /** Indent per tree level (px). */
-  const step = width < 700 ? 9 : 14;
+  const step = compact ? 6 : 14;
   const trackView = Math.max(50, width - NW);
   const padL = trackView / 2;
   const geo = useMemo<Geo>(() => ({ pps, padL, fps: project.fps, duration: project.duration }), [pps, padL, project.fps, project.duration]);
@@ -384,8 +373,25 @@ export function Timeline() {
     });
   }, [pps, width]);
 
+  // The graph editor replaces the timeline; come back to the same rows.
+  useLayoutEffect(() => {
+    scrollRef.current!.scrollTop = savedScrollTop;
+  }, []);
+
+  // Bring the selected layer's row into view (e.g. picked on the canvas inside a group).
+  useEffect(() => {
+    const el = scrollRef.current;
+    const row = selectedId ? el?.querySelector<HTMLElement>(`.tl-block[data-id="${CSS.escape(selectedId)}"] > .tl-row.main`) : null;
+    if (!el || !row) return;
+    const ruler = el.querySelector<HTMLElement>('.tl-ruler-row')?.offsetHeight ?? 0;
+    const top = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+    if (top < ruler) el.scrollTop += top - ruler;
+    else if (top + row.offsetHeight > el.clientHeight) el.scrollTop += top + row.offsetHeight - el.clientHeight;
+  }, [selectedId, rows]);
+
   const onScroll = () => {
     const el = scrollRef.current!;
+    savedScrollTop = el.scrollTop;
     const s = useEditor.getState();
     // While playing, scroll position follows the clock; user input pauses first (pointerdown/wheel).
     if (s.playing) return;
@@ -465,6 +471,7 @@ export function Timeline() {
                 layer={r.layer}
                 indent={Math.min(r.depth, 4) * step}
                 caretSpace={hasGroups}
+                compact={compact}
                 retimedBy={r.retimedBy}
                 dimmed={r.hidden}
                 parentName={r.layer.parent ? (layerById(project, r.layer.parent)?.name ?? null) : null}
@@ -529,6 +536,7 @@ const LayerRows = memo(function LayerRows({
   layer,
   indent,
   caretSpace,
+  compact,
   retimedBy,
   dimmed,
   parentName,
@@ -547,6 +555,8 @@ const LayerRows = memo(function LayerRows({
   indent: number;
   /** Reserve room for a group caret so icons line up. */
   caretSpace: boolean;
+  /** Narrow screens: row buttons only on the selected row, to leave room for names. */
+  compact: boolean;
   retimedBy: string | null;
   /** Hidden itself or inside a hidden group. */
   dimmed: boolean;
@@ -568,6 +578,8 @@ const LayerRows = memo(function LayerRows({
   const showKeys = paths.length > 0 && (expanded ?? primary);
   const isGroup = layer.type === 'group';
   const toggleVis = () => patchLayer(layer.id, { visible: !layer.visible });
+  /** Keys of time-remapped properties (or inside a remapped group) live on another clock. */
+  const onCompClock = (path: string) => !retimedBy && (path === 'timeRemap' || !layer.timeRemapOn);
 
   const badges: { icon: IconName; title: string }[] = [];
   if (layer.maskMode && layer.maskMode !== 'none') badges.push({ icon: 'mask', title: MASK_LABEL[layer.maskMode] });
@@ -624,7 +636,7 @@ const LayerRows = memo(function LayerRows({
               </span>
             )}
           </span>
-          {paths.length > 0 && (
+          {paths.length > 0 && (!compact || primary) && (
             <button
               type="button"
               className="tl-mini"
@@ -637,6 +649,7 @@ const LayerRows = memo(function LayerRows({
               <Icon name={showKeys ? 'down' : 'next'} size={12} />
             </button>
           )}
+          {(!compact || primary || !layer.visible) && (
           <button
             type="button"
             className="tl-mini"
@@ -648,9 +661,10 @@ const LayerRows = memo(function LayerRows({
           >
             <Icon name={layer.visible ? 'eye' : 'eyeOff'} size={13} />
           </button>
+          )}
         </div>
         <div className="tl-track" style={{ width: trackW }}>
-          <ClipBar layer={layer} geo={geo} selected={selected} primary={primary} paths={paths} retimedBy={retimedBy} />
+          <ClipBar layer={layer} geo={geo} selected={selected} primary={primary} paths={paths.filter((p) => onCompClock(p.path))} retimedBy={retimedBy} />
         </div>
       </div>
       {showKeys &&
@@ -670,7 +684,7 @@ const LayerRows = memo(function LayerRows({
             </div>
             <div className="tl-track" style={{ width: trackW }}>
               {p.keys.map((k) => (
-                <Diamond key={k.id} layer={layer} path={p.path} k={k} geo={geo} selected={keyId === k.id} />
+                <Diamond key={k.id} layer={layer} path={p.path} k={k} geo={geo} selected={keyId === k.id} direct={onCompClock(p.path)} />
               ))}
             </div>
           </div>
@@ -770,7 +784,7 @@ function ClipBar({
       const ns = Math.min(d.end - minLen, Math.max(0, snap(d.start + dt)));
       update((p) => {
         const l = layerById(p, layer.id);
-        if (l && Math.abs(ns - l.start) > 1e-9) setInPoint(l, ns);
+        if (l && Math.abs(ns - l.start) > 1e-9) shiftInPoint(l, ns);
       }, merge);
     } else {
       const ne = Math.max(d.start + minLen, snap(d.end + dt));
@@ -851,15 +865,19 @@ function Waveform({ layer, width }: { layer: Layer; width: number }) {
   return <canvas ref={ref} className="waveform" />;
 }
 
-/** A keyframe on its property lane, at layer.start + k.t; drag to retime, tap to jump to it. */
-function Diamond({ layer, path, k, geo, selected }: { layer: Layer; path: string; k: Keyframe; geo: Geo; selected: boolean }) {
+/**
+ * A keyframe on its property lane, at layer.start + k.t; drag to retime, tap to
+ * jump to it. Keys on a time-remapped clock (`direct` false) sit at their
+ * layer time, which isn't a comp time, so tapping them doesn't move the playhead.
+ */
+function Diamond({ layer, path, k, geo, selected, direct }: { layer: Layer; path: string; k: Keyframe; geo: Geo; selected: boolean; direct: boolean }) {
   const drag = useRef<{ x0: number; t0: number; moved: boolean; id: number } | null>(null);
   const sel = { layerId: layer.id, path, keyId: k.id };
   return (
     <span
-      className={`diamond ${selected ? 'selected' : ''} ease-${k.ease}`}
+      className={`diamond ${selected ? 'selected' : ''} ${direct ? '' : 'retimed'} ease-${k.ease}`}
       style={{ left: geo.padL + (layer.start + k.t) * geo.pps }}
-      title={`${k.ease} @ ${(layer.start + k.t).toFixed(2)}s`}
+      title={direct ? `${k.ease} @ ${(layer.start + k.t).toFixed(2)}s` : `${k.ease} @ ${k.t.toFixed(2)}s of the layer's remapped time`}
       onPointerDown={(e) => {
         e.stopPropagation();
         (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -880,7 +898,7 @@ function Diamond({ layer, path, k, geo, selected }: { layer: Layer; path: string
         drag.current = null;
         endMerge();
         if (d && !d.moved) {
-          setTime(layer.start + k.t);
+          if (direct) setTime(layer.start + k.t);
           haptic();
         }
       }}

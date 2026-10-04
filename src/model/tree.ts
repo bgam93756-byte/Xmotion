@@ -37,27 +37,40 @@ export function walk(list: Layer[], fn: (layer: Layer, group: Layer | null, dept
 interface Index {
   byId: Map<string, Found>;
   all: Layer[];
+  /** The root's entries when the index was built (to notice in-place edits). */
+  top: Layer[];
 }
 
 const cache = new WeakMap<Layer[], Index>();
 
+function build(root: Layer[]): { ix: Index; drafts: boolean } {
+  const byId = new Map<string, Found>();
+  const all: Layer[] = [];
+  let drafts = isDraft(root);
+  const visit = (list: Layer[], group: Layer | null) => {
+    list.forEach((layer, i) => {
+      if (!drafts && isDraft(layer)) drafts = true;
+      byId.set(layer.id, { layer, list, index: i, group });
+      all.push(layer);
+      if (layer.children?.length) visit(layer.children, layer);
+    });
+  };
+  visit(root, null);
+  return { ix: { byId, all, top: root.slice() }, drafts };
+}
+
+/**
+ * Index of a layer tree, cached per root array. Trees that still hold immer
+ * drafts (inside a store update) are indexed but never cached: the drafts are
+ * revoked once the update finishes, while the root array may live on.
+ */
 function index(root: Layer[]): Index {
-  let ix = cache.get(root);
-  if (!ix) {
-    const byId = new Map<string, Found>();
-    const all: Layer[] = [];
-    const visit = (list: Layer[], group: Layer | null) => {
-      list.forEach((layer, i) => {
-        byId.set(layer.id, { layer, list, index: i, group });
-        all.push(layer);
-        if (layer.children?.length) visit(layer.children, layer);
-      });
-    };
-    visit(root, null);
-    ix = { byId, all };
-    cache.set(root, ix);
-  }
-  return ix;
+  const ix = cache.get(root);
+  if (ix && ix.top.length === root.length && ix.top.every((l, i) => root[i] === l)) return ix;
+  const built = build(root);
+  if (built.drafts) cache.delete(root);
+  else cache.set(root, built.ix);
+  return built.ix;
 }
 
 /** Finds a layer anywhere in the tree (works on immer drafts too). */
@@ -66,8 +79,8 @@ export function findLayer(project: Project, id: string | null | undefined): Foun
   if (isDraft(project.layers)) return findIn(project.layers, id, null);
   const hit = index(project.layers).byId.get(id);
   if (hit && hit.list[hit.index] === hit.layer) return hit;
-  // The index is built per root array; arrays edited in place (outside the
-  // store's immutable updates) make it stale, so search and rebuild.
+  // Arrays edited in place (outside the store's immutable updates) leave the
+  // index stale, so search directly and drop the cached index.
   const found = findIn(project.layers, id, null);
   if (found || hit) cache.delete(project.layers);
   return found;

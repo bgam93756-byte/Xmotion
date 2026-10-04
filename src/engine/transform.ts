@@ -5,11 +5,40 @@ import { buildShape, outlinePoints, type Rect } from './shapes';
 import { layerTimeFx, makeEval, transformFx } from './effects';
 import { layoutText } from './text';
 import { media } from './media';
-import { activeCamera, rayToLayer } from './camera';
+import { activeCamera, rayHit, type Camera } from './camera';
 
 export function ctxFor(project: Project, layer: Layer): EvalContext {
   const f = findLayer(project, layer.id);
   return { project, index: (f?.index ?? 0) + 1 };
+}
+
+/* ---------------- per-frame memo ---------------- */
+
+// World matrices and clocks are pure functions of the (immutable) tree, the
+// layer and the comp time. While a frame renders nothing changes, so they are
+// cached for its duration; deep group nesting would otherwise recompute every
+// ancestor chain for every layer.
+let memoDepth = 0;
+const worldMemo = new Map<Layer, Map<number, DOMMatrix>>();
+const timesMemo = new Map<Layer, Map<number, Times>>();
+
+function memoSet<T>(memo: Map<Layer, Map<number, T>>, layer: Layer, t: number, v: T) {
+  let m = memo.get(layer);
+  if (!m) memo.set(layer, (m = new Map()));
+  m.set(t, v);
+}
+
+/** Runs fn with world matrices and clocks cached (for one rendered frame). */
+export function withMemo<T>(fn: () => T): T {
+  memoDepth++;
+  try {
+    return fn();
+  } finally {
+    if (--memoDepth === 0) {
+      worldMemo.clear();
+      timesMemo.clear();
+    }
+  }
 }
 
 /* ---------------- time ---------------- */
@@ -26,16 +55,27 @@ export function layerTime(layer: Layer, t: number, ec: EvalContext): number {
 
 /** The clock of the container holding a layer (comp time at the root, group time inside groups). */
 export function containerTime(project: Project, layer: Layer, compT: number): number {
-  let t = compT;
-  for (const g of ancestors(project, layer.id)) t = layerTime(g, t, ctxFor(project, g));
-  return t;
+  const group = findLayer(project, layer.id)?.group;
+  return group ? timesOf(project, group, compT).lt : compT;
+}
+
+export interface Times {
+  ec: EvalContext;
+  /** The container's clock. */
+  ct: number;
+  /** The layer's own clock (time remapping and time effects applied). */
+  lt: number;
 }
 
 /** Container time and the layer's own time at a comp time. */
-export function timesOf(project: Project, layer: Layer, compT: number) {
+export function timesOf(project: Project, layer: Layer, compT: number): Times {
+  const cached = memoDepth ? timesMemo.get(layer)?.get(compT) : undefined;
+  if (cached) return cached;
   const ec = ctxFor(project, layer);
   const ct = containerTime(project, layer, compT);
-  return { ec, ct, lt: layerTime(layer, ct, ec) };
+  const times = { ec, ct, lt: layerTime(layer, ct, ec) };
+  if (memoDepth) memoSet(timesMemo, layer, compT, times);
+  return times;
 }
 
 /** Mask layers hide what's below them and are never drawn or picked themselves. */
@@ -84,11 +124,15 @@ export function alongPath(pts: Vec2[], f: number, wrap: boolean): { p: Vec2; ang
   return { p: [x0 + (x1 - x0) * u, y0 + (y1 - y0) * u], ang: Math.atan2(y1 - y0, x1 - x0) };
 }
 
+/** Layers whose Move Along Path is being evaluated (cycle guard). */
+const pathBusy = new Set<string>();
+
 /**
  * Local transform at the layer's own time `lt`. 3D layers (and cameras) get a
  * full 3D matrix with Z position and X/Y rotation; 2D layers stay flat.
+ * Without `withFx` only the layer's own properties count (no transform effects).
  */
-export function localMatrix(layer: Layer, lt: number, ctx: EvalContext, project?: Project, compT?: number): DOMMatrix {
+export function localMatrix(layer: Layer, lt: number, ctx: EvalContext, project?: Project, compT?: number, withFx = true): DOMMatrix {
   let [px, py] = vec(layer, 'position', lt, ctx);
   const [sx, sy] = layer.type === 'camera' ? [100, 100] : vec(layer, 'scale', lt, ctx);
   let rot = num(layer, 'rotation', lt, ctx);
@@ -96,7 +140,7 @@ export function localMatrix(layer: Layer, lt: number, ctx: EvalContext, project?
   const is3D = (layer.threeD && layer.type !== 'group') || layer.type === 'camera';
   let fsx = 1;
   let fsy = 1;
-  if (layer.effects.length) {
+  if (withFx && layer.effects.length) {
     const fx = transformFx(layer, lt, ctx);
     px += fx.dx;
     py += fx.dy;
@@ -105,15 +149,21 @@ export function localMatrix(layer: Layer, lt: number, ctx: EvalContext, project?
     fsy = fx.sy;
     const mp = layer.effects.find((e) => e.enabled && e.type === 'moveAlongPath');
     const ref = mp?.refs?.path && project ? findLayer(project, mp.refs.path)?.layer : undefined;
-    if (mp && ref && ref.id !== layer.id && project && compT !== undefined) {
-      const pts = outlineComp(project, ref, compT);
-      if (pts.length > 1) {
-        const ev = makeEval(layer, mp, lt, ctx);
-        const closed = Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 0.5;
-        const { p, ang } = alongPath(pts, ev.n('progress') / 100 + ev.n('speed') * ev.local, closed);
-        const inv = parentMatrix(project, layer, compT).inverse();
-        [px, py] = apply(inv, p);
-        rot += ev.n('rotation') + (ev.o('orient') === 0 ? (ang * 180) / Math.PI : 0);
+    // A path that depends on this layer (a child, or parented to it) would recurse forever.
+    if (mp && ref && ref.id !== layer.id && project && compT !== undefined && !pathBusy.has(layer.id)) {
+      pathBusy.add(layer.id);
+      try {
+        const pts = outlineComp(project, ref, compT);
+        if (pts.length > 1) {
+          const ev = makeEval(layer, mp, lt, ctx);
+          const closed = Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 0.5;
+          const { p, ang } = alongPath(pts, ev.n('progress') / 100 + ev.n('speed') * ev.local, closed);
+          const inv = parentMatrix(project, layer, compT).inverse();
+          [px, py] = apply(inv, p);
+          rot += ev.n('rotation') + (ev.o('orient') === 0 ? (ang * 180) / Math.PI : 0);
+        }
+      } finally {
+        pathBusy.delete(layer.id);
       }
     }
   }
@@ -144,10 +194,14 @@ export function localMatrix(layer: Layer, lt: number, ctx: EvalContext, project?
  * groups. 2D renderers use its 2D part (a–f); 3D layers use the full matrix.
  */
 export function worldMatrix(project: Project, layer: Layer, compT: number, depth = 0): DOMMatrix {
+  const cached = memoDepth ? worldMemo.get(layer)?.get(compT) : undefined;
+  if (cached) return cached;
   const { ec, lt } = timesOf(project, layer, compT);
   const local = localMatrix(layer, lt, ec, project, compT);
   if (depth > 24) return local;
-  return parentMatrix(project, layer, compT, depth).multiply(local);
+  const m = parentMatrix(project, layer, compT, depth).multiply(local);
+  if (memoDepth) memoSet(worldMemo, layer, compT, m);
+  return m;
 }
 
 /** The space a layer's position lives in: its parent layer, else its group, else the comp. */
@@ -230,33 +284,40 @@ export function apply(m: DOMMatrix, [x, y]: Vec2): Vec2 {
 /* ---------------- hit testing ---------------- */
 
 const notSelectable = (l: Layer) => l.type === 'audio' || l.type === 'adjustment' || l.type === 'camera';
+const is3D = (l: Layer) => !!l.threeD && l.type !== 'group' && l.type !== 'camera';
+/** Layers that draw nothing (and so don't break the renderer's depth-sorted runs of 3D layers). */
+const drawsNothing = (l: Layer) => l.type === 'audio' || l.type === 'null' || l.type === 'camera';
 
-function hitLayer(project: Project, layer: Layer, p: Vec2, compT: number): boolean {
+/** Whether a 2D layer's bounds contain a comp point. */
+function hit2D(project: Project, layer: Layer, p: Vec2, compT: number): boolean {
   const { ec, lt } = timesOf(project, layer, compT);
   const b = localBounds(layer, lt, ec, compT);
-  let lx: number;
-  let ly: number;
-  let pad = 6;
-  if (layer.threeD && layer.type !== 'group') {
-    const hit = rayToLayer(project, layer, p, compT, activeCamera(project, compT));
-    if (!hit) return false;
-    [lx, ly] = hit;
-  } else {
-    const w = worldMatrix(project, layer, compT);
-    // 2D layers (even under a 3D parent) are drawn with the 2D part of their matrix.
-    const m = w.is2D ? w : new DOMMatrix([w.a, w.b, w.c, w.d, w.e, w.f]);
-    const inv = m.inverse();
-    if (Number.isNaN(inv.a)) return false;
-    [lx, ly] = apply(inv, p);
-    pad = 6 / Math.max(0.05, Math.hypot(m.a, m.b));
-  }
+  const w = worldMatrix(project, layer, compT);
+  // 2D layers (even under a 3D parent) are drawn with the 2D part of their matrix.
+  const m = w.is2D ? w : new DOMMatrix([w.a, w.b, w.c, w.d, w.e, w.f]);
+  const inv = m.inverse();
+  if (Number.isNaN(inv.a)) return false;
+  const [lx, ly] = apply(inv, p);
+  const pad = 6 / Math.max(0.05, Math.hypot(m.a, m.b));
   return lx >= b.x - pad && lx <= b.x + b.w + pad && ly >= b.y - pad && ly <= b.y + b.h + pad;
+}
+
+/** Camera depth where a comp point hits a 3D layer's bounds, or null. */
+function hit3D(project: Project, layer: Layer, p: Vec2, compT: number, cam: Camera): number | null {
+  const hit = rayHit(project, layer, p, compT, cam);
+  if (!hit) return null;
+  const { ec, lt } = timesOf(project, layer, compT);
+  const b = localBounds(layer, lt, ec, compT);
+  const pad = 6;
+  const inside = hit.u >= b.x - pad && hit.u <= b.x + b.w + pad && hit.v >= b.y - pad && hit.v <= b.y + b.h + pad;
+  return inside ? hit.depth : null;
 }
 
 /**
  * Top-most selectable layer under a comp-space point. Groups are picked as a
  * whole unless they are "open" (the selection is the group or inside it), in
- * which case their children can be picked directly.
+ * which case their children can be picked directly. Adjacent 3D layers are
+ * drawn sorted by depth, so among them the one nearest the camera wins.
  */
 export function hitTest(project: Project, p: Vec2, compT: number, selectedId?: string | null): Layer | null {
   const open = new Set<string>();
@@ -265,16 +326,37 @@ export function hitTest(project: Project, p: Vec2, compT: number, selectedId?: s
     if (sel?.type === 'group') open.add(sel.id);
     for (const g of ancestors(project, selectedId)) open.add(g.id);
   }
+  let cam: Camera | null = null;
+  const camera = () => (cam ??= activeCamera(project, compT));
+  const shown = (l: Layer, t: number) => l.visible && !isMaskLayer(l) && isActive(l, t);
   const search = (list: Layer[], t: number): Layer | null => {
-    for (const layer of list) {
-      if (!layer.visible || layer.locked || isMaskLayer(layer) || !isActive(layer, t)) continue;
+    for (let i = 0; i < list.length; i++) {
+      const layer = list[i];
+      if (!shown(layer, t)) continue;
+      if (is3D(layer) && !layer.clip) {
+        // The run of 3D layers the renderer depth-sorts together.
+        let best: { layer: Layer; depth: number } | null = null;
+        let j = i;
+        for (; j < list.length; j++) {
+          const l = list[j];
+          if (drawsNothing(l) || !shown(l, t)) continue;
+          if (!is3D(l) || l.clip) break;
+          if (l.locked || notSelectable(l)) continue;
+          const d = hit3D(project, l, p, compT, camera());
+          if (d !== null && (!best || d < best.depth)) best = { layer: l, depth: d };
+        }
+        if (best) return best.layer;
+        i = j - 1;
+        continue;
+      }
+      if (layer.locked) continue;
       if (layer.type === 'group') {
         const inner = search(layer.children ?? [], layerTime(layer, t, ctxFor(project, layer)));
         if (inner) return open.has(layer.id) ? inner : layer;
         continue;
       }
       if (notSelectable(layer)) continue;
-      if (hitLayer(project, layer, p, compT)) return layer;
+      if (is3D(layer) ? hit3D(project, layer, p, compT, camera()) !== null : hit2D(project, layer, p, compT)) return layer;
     }
     return null;
   };

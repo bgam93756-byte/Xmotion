@@ -4,7 +4,18 @@ import { PROJECT_PRESETS, createProject } from '../model/schema';
 import { TEMPLATES } from '../model/templates';
 import { media } from '../engine/media';
 import { thumbnail } from '../engine/renderer';
-import { deleteProject, duplicateProject, exportBundle, getAsset, importBundle, listProjects, loadProject, saveProject, type ProjectSummary } from '../engine/storage';
+import {
+  deleteProject,
+  duplicateProject,
+  exportBundle,
+  getAsset,
+  importBundle,
+  listProjects,
+  loadProject,
+  onStorageBlocked,
+  saveProject,
+  type ProjectSummary,
+} from '../engine/storage';
 import { openProject } from '../state/store';
 import { pickFiles, saveFile } from '../platform';
 import { Icon } from './icons';
@@ -35,6 +46,13 @@ export function Home() {
         setProjects([]);
         setError(`Storage unavailable: ${(e as Error).message}`);
       });
+  useEffect(
+    () =>
+      onStorageBlocked((blocked) =>
+        setError(blocked ? 'Xmotion is open in another tab. Close it to finish updating your projects.' : null),
+      ),
+    [],
+  );
   useEffect(() => {
     void refresh();
   }, []);

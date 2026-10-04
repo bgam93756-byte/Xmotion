@@ -5,7 +5,7 @@ import { applyEffects, hasPixelEffects, opacityFx, renderFx, shapeFx, textFx, ty
 import { media } from './media';
 import { buildShape, outlinePoints, type Rect } from './shapes';
 import { drawText, layoutText } from './text';
-import { corners, isActive, isMaskLayer, localBounds, outlineComp, shapeParams, timesOf, worldMatrix } from './transform';
+import { corners, isActive, isMaskLayer, localBounds, outlineComp, shapeParams, timesOf, withMemo, worldMatrix } from './transform';
 import { activeCamera, depthAt, glMat3, homography, inv3, mul3, projectLocal, type Camera, type Mat3 } from './camera';
 import { glfx, LUMA_MATTE_FRAG, WARP_FRAG, type Common } from './gl';
 
@@ -263,8 +263,8 @@ function lumaMatte(buf: HTMLCanvasElement) {
   const img = c.getImageData(0, 0, buf.width, buf.height);
   const d = img.data;
   for (let i = 0; i < d.length; i += 4) {
-    const a = d[i + 3] / 255;
-    const m = a > 0 ? ((0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255 / a) * a : 0;
+    // getImageData is not premultiplied: the matte is luma × alpha.
+    const m = ((0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255) * (d[i + 3] / 255);
     d[i] = d[i + 1] = d[i + 2] = 0;
     d[i + 3] = Math.round(Math.min(1, m) * 255);
   }
@@ -276,6 +276,10 @@ export class Renderer {
 
   /** Renders the comp at time t into `out` (resized to width*scale x height*scale). */
   render(project: Project, t: number, out: HTMLCanvasElement, opts: RenderOpts) {
+    withMemo(() => this.renderFrame(project, t, out, opts));
+  }
+
+  private renderFrame(project: Project, t: number, out: HTMLCanvasElement, opts: RenderOpts) {
     const W = Math.max(1, Math.round(project.width * opts.scale));
     const H = Math.max(1, Math.round(project.height * opts.scale));
     if (out.width !== W || out.height !== H) {
@@ -312,21 +316,11 @@ export class Renderer {
     ctx.globalCompositeOperation = 'source-over';
     ctx.clearRect(0, 0, W, H);
     const f: Frame = { project, compT: t, s: opts.scale, W, H, cam: null };
-    // Masks at the root would also cut the background, so render above it in isolation.
-    if (!opts.transparent && project.layers.some(isMask)) {
-      const buf = this.pool.acquire(W, H);
-      this.container(f, project.layers, buf.getContext('2d')!, t);
+    if (!opts.transparent) {
       ctx.fillStyle = project.background;
       ctx.fillRect(0, 0, W, H);
-      ctx.drawImage(buf, 0, 0);
-      this.pool.release(buf);
-    } else {
-      if (!opts.transparent) {
-        ctx.fillStyle = project.background;
-        ctx.fillRect(0, 0, W, H);
-      }
-      this.container(f, project.layers, ctx, t);
     }
+    this.container(f, project.layers, ctx, t, opts.transparent ? null : project.background);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
 
@@ -341,25 +335,29 @@ export class Renderer {
   private order(f: Frame, list: Layer[], ct: number): number[] {
     const idx: number[] = [];
     for (let i = list.length - 1; i >= 0; i--) if (isDrawable(list[i])) idx.push(i);
-    const sortable = (l: Layer) => is3DLayer(l) && !isMask(l) && !l.clip && l.visible && isActive(l, ct);
+    const shown = (l: Layer) => l.visible && isActive(l, ct);
+    const sortable = (l: Layer) => is3DLayer(l) && !isMask(l) && !l.clip && shown(l);
     for (let a = 0; a < idx.length; ) {
       if (!sortable(list[idx[a]])) {
         a++;
         continue;
       }
+      // Hidden layers draw nothing, so they don't split a run.
       let b = a;
-      while (b < idx.length && sortable(list[idx[b]])) b++;
-      if (b - a > 1) {
+      while (b < idx.length && (sortable(list[idx[b]]) || !shown(list[idx[b]]))) b++;
+      const run = idx.slice(a, b).filter((i) => sortable(list[i]));
+      if (run.length > 1) {
         const cam = this.camera(f);
-        const run = idx.slice(a, b).map((i, k) => {
+        const hidden = idx.slice(a, b).filter((i) => !sortable(list[i]));
+        const depths = run.map((i, k) => {
           const l = list[i];
           const { ec, lt } = timesOf(f.project, l, f.compT);
           const lb = localBounds(l, lt, ec, f.compT);
           const Hm = homography(cam, worldMatrix(f.project, l, f.compT));
           return { i, k, d: depthAt(Hm, lb.x + lb.w / 2, lb.y + lb.h / 2) };
         });
-        run.sort((p, q) => q.d - p.d || p.k - q.k);
-        run.forEach((r, k) => (idx[a + k] = r.i));
+        depths.sort((p, q) => q.d - p.d || p.k - q.k);
+        [...hidden, ...depths.map((r) => r.i)].forEach((i, k) => (idx[a + k] = i));
       }
       a = b;
     }
@@ -370,8 +368,13 @@ export class Renderer {
     return Math.min(1, Math.max(0, (num(layer, 'opacity', lt, ec) / 100) * (layer.effects.length ? opacityFx(layer, lt, ec) : 1)));
   }
 
-  /** Composites a container's layers (root or a group's children) into ctx; `ct` is the container's clock. */
-  private container(f: Frame, list: Layer[], ctx: CanvasRenderingContext2D, ct: number) {
+  /**
+   * Composites a container's layers (root or a group's children) into ctx;
+   * `ct` is the container's clock. At the root, `background` is the comp
+   * background already painted into ctx: masks cut it too, so it is put back
+   * underneath after each mask.
+   */
+  private container(f: Frame, list: Layer[], ctx: CanvasRenderingContext2D, ct: number, background: string | null = null) {
     const { project, W, H } = f;
     const order = this.order(f, list, ct);
 
@@ -404,7 +407,14 @@ export class Renderer {
       const visible = layer.visible && isActive(layer, ct);
       if (isMask(layer)) {
         flush();
-        if (visible) this.applyMask(f, layer, ctx);
+        if (visible && this.applyMask(f, layer, ctx) && background) {
+          ctx.save();
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.globalCompositeOperation = 'destination-over';
+          ctx.fillStyle = background;
+          ctx.fillRect(0, 0, W, H);
+          ctx.restore();
+        }
         continue;
       }
       if (!visible) {
@@ -468,17 +478,18 @@ export class Renderer {
     const buf = this.pool.acquire(f.W, f.H);
     if (layer.type === 'group') this.container(f, layer.children ?? [], buf.getContext('2d')!, lt);
     else this.drawLayerFx(buf.getContext('2d')!, f, layer, lt, ec, null);
-    applyEffects(layer, buf, this.fxContext(f, layer, lt, ec, bg));
+    // Group bounds are costly, so the effect context is only built when needed.
+    if (hasPixelEffects(layer)) applyEffects(layer, buf, this.fxContext(f, layer, lt, ec, bg));
     return buf;
   }
 
-  /** Masks everything drawn so far in the container. */
-  private applyMask(f: Frame, layer: Layer, ctx: CanvasRenderingContext2D) {
+  /** Masks everything drawn so far in the container (returns false when nothing changed). */
+  private applyMask(f: Frame, layer: Layer, ctx: CanvasRenderingContext2D): boolean {
     const { ec, lt } = timesOf(f.project, layer, f.compT);
     const opacity = this.opacityOf(layer, lt, ec);
     const mode = layer.maskMode!;
     const inverted = mode === 'alphaInv' || mode === 'lumaInv';
-    if (inverted && opacity <= 0) return;
+    if (inverted && opacity <= 0) return false;
     const buf = this.layerBuffer(f, layer, lt, ec, ctx.canvas);
     if (mode === 'luma' || mode === 'lumaInv') lumaMatte(buf);
     ctx.save();
@@ -488,6 +499,7 @@ export class Renderer {
     ctx.drawImage(buf, 0, 0);
     ctx.restore();
     this.pool.release(buf);
+    return true;
   }
 
   /**
@@ -532,7 +544,7 @@ export class Renderer {
 
     const src = this.pool.acquire(Bw, Bh);
     this.drawLayerFx(src.getContext('2d')!, f, layer, lt, ec, L);
-    applyEffects(layer, src, this.fxContext(f, layer, lt, ec, bg, L, k, [Bw, Bh]));
+    if (hasPixelEffects(layer)) applyEffects(layer, src, this.fxContext(f, layer, lt, ec, bg, L, k, [Bw, Bh]));
 
     // Output pixel → comp → local plane → source pixel.
     const inv = inv3(Hc);
