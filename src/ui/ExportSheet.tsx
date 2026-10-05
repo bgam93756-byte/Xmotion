@@ -150,7 +150,7 @@ export function ExportSheet() {
         <>
           <h4>Frame rate</h4>
           <div className="chips">
-            {(format === 'gif' ? [10, 12, 15, 20] : [24, 25, 30, 50, 60]).map((f) => (
+            {(format === 'gif' ? [10, 12, 15, 20] : [24, 25, 30, 50, 60, 120]).map((f) => (
               <button key={f} type="button" className={`chip ${f === fps ? 'on' : ''}`} onClick={() => setFps(f)}>
                 {f} fps
               </button>

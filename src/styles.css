@@ -538,6 +538,26 @@ h4 {
 .bottombar {
   grid-area: bar;
 }
+/* Phones while editing: preview, timeline and properties all on screen (no bottom bar). */
+.editor.narrow.editing {
+  grid-template-rows: auto minmax(96px, 1fr) auto clamp(112px, 21vh, 200px) minmax(0, 42vh);
+  grid-template-areas: 'top' 'view' 'trans' 'tl' 'props';
+}
+.editor.narrow.editing .bottombar {
+  display: none;
+}
+.ed-props {
+  grid-area: props;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  border-radius: 16px 16px 0 0;
+  box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.35);
+  padding-bottom: calc(12px + var(--sab));
+}
 .ed-inspector {
   grid-area: insp;
   border-left: 1px solid var(--line);

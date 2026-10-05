@@ -68,7 +68,7 @@ export function Editor() {
 
   return (
     <div
-      className={`editor ${wide ? 'wide' : 'narrow'} ${graph ? 'has-graph' : ''}`}
+      className={`editor ${wide ? 'wide' : 'narrow'} ${graph ? 'has-graph' : ''} ${!wide && sheet === 'props' ? 'editing' : ''}`}
       onDragOver={(e) => {
         if (e.dataTransfer.types.includes('Files')) {
           e.preventDefault();
@@ -95,10 +95,11 @@ export function Editor() {
           <Inspector />
         </aside>
       )}
+      {/* Phones: properties sit under the timeline so both stay visible while editing. */}
       {!wide && sheet === 'props' && (
-        <Sheet kind="props" title="Properties" modal={false} bare>
+        <section className="ed-props" aria-label="Properties">
           <Inspector />
-        </Sheet>
+        </section>
       )}
       {sheet === 'add' && (
         <Sheet kind="add" title="Add layer">

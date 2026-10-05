@@ -43,11 +43,12 @@ A keyframe motion-graphics and video editor for **iPhone and iPad** (also runs i
 - **One-tap animation presets:** In, Out, Loop and Text.
 - **Timeline:**
   - Swipe to scrub with a fixed center playhead, and pinch to zoom.
+  - On phones the timeline stays on screen while you edit properties (they open below it).
   - Drag clips to move them; trim handles keep the content in place.
   - Drag layers by their icon to reorder them or move them into and out of groups.
   - Split, duplicate, and copy/paste layers.
 - **Export:**
-  - MP4 (H.264), WebM, GIF, PNG, and PNG or JPEG image sequences (zipped), up to 4K.
+  - MP4 (H.264), WebM, GIF, PNG, and PNG or JPEG image sequences (zipped), up to 4K and 120 fps.
   - Rendered frame by frame, so frames are exact and every effect is included.
   - Audio from videos and music is mixed in, with volume and fades.
   - On iPhone, the finished file opens the share sheet, so you can save it to Photos or post it to TikTok/Instagram. It's also saved in Files › Xmotion › Exports.

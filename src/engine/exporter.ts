@@ -53,6 +53,40 @@ const QUALITY: Record<ExportQuality, Quality> = {
   max: QUALITY_VERY_HIGH,
 };
 
+const QUALITY_LEVEL: Record<ExportQuality, number> = { low: 0.25, medium: 0.5, high: 0.75, max: 1 };
+const CODEC_EFFICIENCY: Record<string, number> = { avc: 1, hevc: 0.6, vp9: 0.6, av1: 0.4, vp8: 1.2 };
+
+/** Bitrate for high frame rates: mediabunny's per-quality rate, grown with the frame rate. */
+function highFpsBitrate(codec: string, w: number, h: number, fps: number, q: ExportQuality): number {
+  const base = 3_000_000 * Math.pow((w * h) / (1920 * 1080), 0.95) * (CODEC_EFFICIENCY[codec] ?? 1);
+  const factor = 0.3 * Math.exp(2.5538 * QUALITY_LEVEL[q]);
+  return Math.ceil((base * factor * Math.sqrt(fps / 30)) / 1000) * 1000;
+}
+
+/**
+ * H.264 codec string with a level that allows the frame size *and* rate
+ * (macroblocks per second); 1080p at 120 fps needs level 5.1.
+ */
+function avcCodecString(w: number, h: number, fps: number): string {
+  const frame = Math.ceil(w / 16) * Math.ceil(h / 16);
+  const perSecond = frame * fps;
+  // [level_idc, max macroblocks per frame, max macroblocks per second]
+  const levels: [number, number, number][] = [
+    [0x1f, 3600, 108000],
+    [0x20, 5120, 216000],
+    [0x28, 8192, 245760],
+    [0x2a, 8704, 522240],
+    [0x32, 22080, 589824],
+    [0x33, 36864, 983040],
+    [0x34, 36864, 2073600],
+    [0x3c, 139264, 4177920],
+    [0x3d, 139264, 8355840],
+    [0x3e, 139264, 16711680],
+  ];
+  const level = levels.find(([, f, m]) => frame <= f && perSecond <= m) ?? levels[levels.length - 1];
+  return `avc1.6400${level[0].toString(16).padStart(2, '0')}`;
+}
+
 export function supportsVideoExport() {
   return typeof VideoEncoder !== 'undefined';
 }
@@ -264,7 +298,14 @@ export async function exportProject(project: Project, opts: ExportOptions, onPro
     const vcodec = await getFirstEncodableVideoCodec(isMp4 ? ['avc', 'hevc', 'av1', 'vp9'] : ['vp9', 'vp8', 'av1'], { width: W, height: H, bitrate: quality });
     if (!vcodec) throw new Error(`Your browser can't encode ${opts.format.toUpperCase()} video at ${W}×${H}. Try a smaller size or the other format.`);
     const output = new Output({ format, target: new BufferTarget() });
-    const videoSource = new CanvasSource(out, { codec: vcodec, bitrate: quality, keyFrameInterval: 2 });
+    // Above 60 fps the default level and bitrate (sized for ~30 fps) are too low.
+    const fast = fps > 60;
+    const videoSource = new CanvasSource(out, {
+      codec: vcodec,
+      bitrate: fast ? highFpsBitrate(vcodec, W, H, fps, opts.quality) : quality,
+      keyFrameInterval: 2,
+      ...(fast && vcodec === 'avc' ? { fullCodecString: avcCodecString(W, H, fps) } : {}),
+    });
     output.addVideoTrack(videoSource, { frameRate: fps });
 
     onProgress(0, 'Mixing audio…');

@@ -189,7 +189,7 @@ function ProjectPanel({ project }: { project: Project }) {
         </div>
         <div className="row">
           <span className="row-label">Frame rate</span>
-          <Select value={String(project.fps)} options={['12', '15', '24', '25', '30', '50', '60']} onChange={(v) => set({ fps: Number(v) })} />
+          <Select value={String(project.fps)} options={['12', '15', '24', '25', '30', '50', '60', '120']} onChange={(v) => set({ fps: Number(v) })} />
         </div>
         <div className="row">
           <span className="row-label">Duration</span>
