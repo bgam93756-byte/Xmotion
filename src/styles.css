@@ -1508,13 +1508,14 @@ h4 {
   flex-wrap: wrap;
 }
 
+/* Keyframe button: an outlined diamond (filled when there's a key at the playhead). */
 .kf-btn {
-  width: 26px;
-  height: 26px;
-  border: 0;
-  border-radius: 7px;
-  background: none;
-  color: #4b4f60;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+  color: #a9aec2;
   display: grid;
   place-items: center;
   flex: none;
@@ -1523,12 +1524,12 @@ h4 {
 
 .kf-btn.animated {
   color: var(--key);
-  opacity: 0.55;
+  border-color: rgba(255, 201, 77, 0.45);
 }
 
 .kf-btn.on {
-  opacity: 1;
-  background: rgba(255, 201, 77, 0.15);
+  background: rgba(255, 201, 77, 0.18);
+  border-color: var(--key);
 }
 
 .prop-label {

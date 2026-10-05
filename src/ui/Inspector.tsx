@@ -665,7 +665,7 @@ export function PropRow({ project, layer, path, def }: { project: Project; layer
           title={animated ? (keyHere ? 'Remove keyframe here' : 'Add keyframe here') : 'Animate this property (add first keyframe)'}
           onClick={() => (animated ? toggleKeyAtPlayhead(layer.id, path) : toggleAnimated(layer.id, path))}
         >
-          <Icon name="keyframe" size={12} />
+          <Icon name={keyHere ? 'keyframe' : 'diamond'} size={14} />
         </button>
         <button
           type="button"
