@@ -18,6 +18,9 @@ if (!isNative && 'serviceWorker' in navigator && location.protocol === 'https:')
   window.addEventListener('load', () => void navigator.serviceWorker.register('./sw.js').catch(() => undefined));
 }
 
+// Ask the browser not to clear saved projects and media when space runs low.
+if (!isNative) void navigator.storage?.persist?.().catch(() => false);
+
 // Test/automation hook: open the app with ?debug to reach the editor state from the console.
 if (location.search.includes('debug')) {
   void Promise.all([

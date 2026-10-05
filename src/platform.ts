@@ -65,6 +65,19 @@ export async function saveFile(blob: Blob, filename: string): Promise<'shared' |
   return 'downloaded';
 }
 
+/**
+ * Whether the web version can hand files to the share sheet (iPhone/iPad
+ * Safari: Save Video / Save Image to Photos). It only opens from a tap.
+ */
+export function canShareFiles(): boolean {
+  if (isNative || !isTouch || typeof navigator.canShare !== 'function') return false;
+  try {
+    return navigator.canShare({ files: [new File([''], 'x.mp4', { type: 'video/mp4' })] });
+  } catch {
+    return false;
+  }
+}
+
 /** Opens the system file / photo picker. */
 export function pickFiles(accept: string, multiple = true): Promise<File[]> {
   return new Promise((res) => {

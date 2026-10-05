@@ -1,0 +1,61 @@
+name: Publish web app (GitHub Pages)
+
+# Builds the web version and publishes it to the gh-pages branch. Turn GitHub
+# Pages on once (Settings › Pages › Deploy from a branch › gh-pages › / (root))
+# and the app is served at https://<owner>.github.io/<repo>/ .
+# See README → "Use it in Safari (no install)".
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**', '!gh-pages']
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'index.html'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.ts'
+      - '.github/workflows/pages.yml'
+
+permissions:
+  contents: write
+
+# Only the newest push gets published.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test and build web app
+        run: |
+          npm test
+          npm run build
+
+      - name: Publish to the gh-pages branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd dist
+          # Serve the files as they are (no Jekyll processing).
+          touch .nojekyll
+          git init -q -b gh-pages
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -q -m "Web app from ${GITHUB_REF_NAME} @ ${GITHUB_SHA::7}"
+          git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+          echo "Published. With Pages on, the app is at https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/" >> "$GITHUB_STEP_SUMMARY"

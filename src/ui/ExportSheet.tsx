@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react';
 import { MAX_SEQUENCE_FRAMES, exportProject, frameCount, isSequence, supportsVideoExport, type ExportFormat, type ExportQuality } from '../engine/exporter';
 import { stop, useEditor } from '../state/store';
-import { saveFile, isNative } from '../platform';
+import { canShareFiles, saveFile, isNative } from '../platform';
 import { Icon } from './icons';
 import { Toggle } from './controls/fields';
 
@@ -66,7 +66,8 @@ export function ExportSheet() {
         abort.current.signal,
       );
       setPhase({ kind: 'done', blob, filename, ms: performance.now() - started });
-      await saveFile(blob, filename);
+      // In a phone browser the share sheet needs a tap, so the Share button opens it.
+      if (!canShareFiles()) await saveFile(blob, filename);
     } catch (e) {
       if ((e as DOMException).name === 'AbortError') setPhase({ kind: 'idle' });
       else setPhase({ kind: 'error', msg: (e as Error).message || 'Export failed' });
@@ -106,9 +107,11 @@ export function ExportSheet() {
           {mb} MB · rendered in {(phase.ms / 1000).toFixed(1)} s · no watermark
         </p>
         {isNative && <p className="hint">Also saved in Files › On My iPhone › Xmotion › Exports.</p>}
+        {!isNative && canShareFiles() && <p className="hint">Tap Share, then Save Video (or Save Image / Save to Files).</p>}
         <div className="row-btns">
           <button type="button" className="btn primary" onClick={() => void saveFile(phase.blob, phase.filename)}>
-            <Icon name="share" size={16} /> {isNative ? (phase.filename.endsWith('.zip') ? 'Share / Save to Files' : 'Share / Save to Photos') : 'Save again'}
+            <Icon name="share" size={16} />{' '}
+            {isNative || canShareFiles() ? (phase.filename.endsWith('.zip') ? 'Share / Save to Files' : 'Share / Save to Photos') : 'Download again'}
           </button>
           <button type="button" className="btn ghost" onClick={() => setPhase({ kind: 'idle' })}>
             Export another

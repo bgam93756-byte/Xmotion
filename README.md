@@ -80,9 +80,19 @@ npm run ios        # builds the web app, syncs it into ios/, opens Xcode
 
 In Xcode, select your Team under the **App** target's *Signing & Capabilities*, choose your iPhone and press **Run**.
 
-### Without installing anything
+## Use it in Safari (no install)
 
-Host the `dist/` folder on any static host (for example GitHub Pages), open it in Safari, then **Share › Add to Home Screen**. It runs as a full-screen web app and works offline after the first load.
+No computer, Apple ID or re-signing is needed. The web version is the same app running in Safari.
+
+1. Open **https://bgam93756-byte.github.io/Xmotion/** in Safari on your iPhone or iPad (iOS 16.4 or later).
+2. Tap **Share › Add to Home Screen**. Xmotion then opens full screen from its icon and works offline after the first load.
+3. Open it from that icon from now on. The Home Screen app keeps its own projects, separate from Safari tabs and from the .ipa app. To move a project between them, use **Share project file** (in a project's menu on the Home screen, it makes an `.xmotion` file) and **Import project**.
+
+Exports work the same way: when one finishes, tap **Share / Save to Photos**, then **Save Video**.
+
+**One-time setup (repository owner):** in the repository on GitHub, open **Settings › Pages**. Under *Build and deployment* choose **Deploy from a branch**, pick **gh-pages** and **/ (root)**, and tap **Save**. After about a minute the site is live. The **Publish web app (GitHub Pages)** workflow rebuilds the `gh-pages` branch on every push that changes the app, so the site always shows the latest push.
+
+You can also host the `dist/` folder from `npm run build` on any other static host.
 
 ## Development
 
