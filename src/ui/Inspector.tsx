@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { BlendMode, EaseName, Keyframe, Layer, MaskMode, Project, PropValue, ShapeKind, TextAnimator, TextAnimUnit, Vec2 } from '../model/types';
 import { evalPropAt, keyAt, vec } from '../model/animate';
@@ -12,7 +12,7 @@ import { allLayers, ancestors, findLayer } from '../model/tree';
 import { FONT_LIST, ensureFont } from '../engine/fonts';
 import { media } from '../engine/media';
 import { activeCamera } from '../engine/camera';
-import { ctxFor, isRetimed, localBounds, propClock, timesOf } from '../engine/transform';
+import { activeAt, ctxFor, isRetimed, localBounds, propClock, timesOf } from '../engine/transform';
 import {
   addEffect,
   copyEffects,
@@ -566,7 +566,7 @@ function TypeSettings({ project, layer }: { project: Project; layer: Layer }) {
               ))}
             </div>
           )}
-          <p className="hint">While the group is selected, tap a layer inside it on the canvas to edit that layer.</p>
+          <p className="hint">Double-tap a layer of the group on the canvas to edit that layer.</p>
         </Section>
       );
     }
@@ -579,11 +579,12 @@ function CameraInfo({ project, layer }: { project: Project; layer: Layer }) {
   const time = useEditor((s) => s.time);
   const has3D = allLayers(project).some((l) => l.threeD);
   const inUse = activeCamera(project, time).layer;
+  const active = activeAt(project, layer, time);
   return (
     <div className="cam-info">
       <p className="hint">3D layers are seen through the top-most visible camera. 2D layers stay flat on the screen.</p>
-      {inUse && inUse.id !== layer.id && <p className="hint">“{inUse.name}” is above this camera, so it is the one in use at the playhead.</p>}
-      {!inUse && <p className="hint">This camera isn’t active at the playhead (hidden or outside its In/Out).</p>}
+      {active && inUse && inUse.id !== layer.id && <p className="hint">“{inUse.name}” is above this camera, so it is the one in use at the playhead.</p>}
+      {!active && <p className="hint">This camera isn’t active at the playhead (hidden, outside its In/Out, or in a hidden group).</p>}
       {!has3D && <p className="hint cam-note">No 3D layers yet. Turn on “3D layer” in a layer’s Timing &amp; compositing section.</p>}
     </div>
   );
@@ -780,6 +781,11 @@ const EXPR_EXAMPLES = ['wiggle(2, 30)', 'value + time * 90', 'value + [0, sin(ti
 
 function ExprInput({ value, onChange }: { value: string; onChange: (expr: string | undefined) => void }) {
   const [text, setText] = useState(value);
+  const editing = useRef(false);
+  // Follow outside changes (reset, paste, undo) unless the user is typing.
+  useEffect(() => {
+    if (!editing.current) setText(value);
+  }, [value]);
   const err = text.trim() ? validateExpr(text) : null;
   const apply = () => {
     if (!text.trim()) onChange(undefined);
@@ -793,7 +799,11 @@ function ExprInput({ value, onChange }: { value: string; onChange: (expr: string
         value={text}
         spellCheck={false}
         onChange={(e) => setText(e.target.value)}
-        onBlur={apply}
+        onFocus={() => (editing.current = true)}
+        onBlur={() => {
+          editing.current = false;
+          apply();
+        }}
         onKeyDown={(e) => {
           e.stopPropagation();
           if (e.key === 'Enter') apply();

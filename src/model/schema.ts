@@ -324,10 +324,13 @@ export const PROJECT_PRESETS: { label: string; w: number; h: number }[] = [
   { label: 'Cinematic 21:9', w: 2560, h: 1080 },
 ];
 
+/** Project file format written by this app. */
+export const PROJECT_VERSION = 2;
+
 export function createProject(opts: Partial<Project> = {}): Project {
   const now = Date.now();
   return {
-    version: 1,
+    version: PROJECT_VERSION,
     id: uid('P'),
     name: 'Untitled project',
     width: 1080,

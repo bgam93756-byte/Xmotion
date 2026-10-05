@@ -150,7 +150,8 @@ export interface MotionBlur {
 }
 
 export interface Project {
-  version: 1;
+  /** 2 since groups, masks, 3D layers, cameras and time remapping. */
+  version: 1 | 2;
   id: string;
   name: string;
   width: number;

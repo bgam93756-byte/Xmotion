@@ -55,7 +55,7 @@ const LEARN: [string, string][] = [
 ];
 
 const TOPICS: [string, string][] = [
-  ['Groups', 'Select several layers (long-press or Ctrl-click in the timeline) › More › Group (Ctrl+G). A group moves, fades, masks and retimes its layers as one; with the group selected, tap a layer inside it on the canvas to edit that layer.'],
+  ['Groups', 'Select several layers (long-press or Ctrl-click in the timeline) › More › Group (Ctrl+G). A group moves, fades, masks and retimes its layers as one; double-tap a layer inside it on the canvas to edit that layer.'],
   ['Elements', 'Select layers › More › Save as element. Add › Elements inserts them into any project at the playhead, with their media and fonts.'],
   ['Time remapping', 'Edit › Timing & compositing › Time remap, then keyframe the Time remap value: flat holds a frame, going down plays in reverse, steeper is faster. Works on groups too.'],
   ['Grid & guides', 'Tap the grid button on the canvas for the grid, rule of thirds, safe areas and snapping. Add guides there and drag them into place; drop one outside the canvas to remove it.'],

@@ -284,15 +284,18 @@ export function glfx(): GLFX | null {
 }
 
 /**
- * Perspective warp for 3D layers: u_inv maps an output pixel to homogeneous
- * source-buffer pixels; its third component is 1 / camera depth.
+ * Perspective warp: u_inv maps an output pixel to homogeneous source pixels.
+ * Drawing a 3D layer (u_near = 1), its third component is 1 / camera depth and
+ * points nearer than the near plane are cut; warping frame-space inputs into a
+ * layer's plane (u_near = 0) only needs it positive.
  */
 export const WARP_FRAG = `
 uniform mat3 u_inv;
 uniform vec2 u_src;
+uniform float u_near;
 void main() {
   vec3 q = u_inv * vec3(pix(), 1.0);
-  if (q.z <= 0.0 || q.z > 1.0) { gl_FragColor = vec4(0.0); return; }
+  if (q.z <= 0.0 || (u_near > 0.5 && q.z > 1.0)) { gl_FragColor = vec4(0.0); return; }
   vec2 sp = q.xy / q.z;
   vec2 uv = vec2(sp.x / u_src.x, 1.0 - sp.y / u_src.y);
   if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) { gl_FragColor = vec4(0.0); return; }

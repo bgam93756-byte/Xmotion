@@ -1,5 +1,6 @@
 import type { AssetMeta, Layer, Project } from '../model/types';
 import { uid } from '../model/ids';
+import { PROJECT_VERSION } from '../model/schema';
 
 const DB_NAME = 'xmotion';
 const DB_VERSION = 2;
@@ -160,11 +161,16 @@ export async function saveElement(rec: ElementRecord): Promise<void> {
   await tx('elements', 'readwrite', (s) => s.put(rec));
 }
 
-export async function deleteElement(id: string): Promise<void> {
+/**
+ * Deletes an element and the media nothing else uses. `keep` lists asset ids
+ * still needed in memory (the open project and its undo history).
+ */
+export async function deleteElement(id: string, keep: Iterable<string> = []): Promise<void> {
   const rec = await tx<ElementRecord | undefined>('elements', 'readonly', (s) => s.get(id));
   await tx('elements', 'readwrite', (s) => s.delete(id));
   if (!rec) return;
   const used = await usedAssets();
+  for (const k of keep) used.add(k);
   for (const a of rec.assets) if (!used.has(a.id)) await tx('assets', 'readwrite', (s) => s.delete(a.id));
 }
 
@@ -226,7 +232,8 @@ export async function importBundle(file: Blob): Promise<Project> {
     // Plain JSON project (no media).
     project = JSON.parse(new TextDecoder().decode(bytes));
   }
-  if (!project || project.version !== 1 || !Array.isArray(project.layers)) throw new Error('Not an Xmotion project file');
+  if (!project || typeof project.version !== 'number' || !Array.isArray(project.layers)) throw new Error('Not an Xmotion project file');
+  if (project.version > PROJECT_VERSION) throw new Error('This project was made with a newer version of Xmotion. Update the app to open it.');
   for (const a of assets) {
     const blob = new Blob([buf.slice(offset, offset + a.size)], { type: a.meta.mime });
     offset += a.size;

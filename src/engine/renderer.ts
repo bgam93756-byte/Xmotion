@@ -1,12 +1,13 @@
 import type { BlendMode, Layer, Project, Vec2 } from '../model/types';
 import { col, num, type EvalContext } from '../model/animate';
 import { findLayer } from '../model/tree';
-import { applyEffects, hasPixelEffects, opacityFx, renderFx, shapeFx, textFx, type FxContext } from './effects';
+import { applyEffects, enabledFx, hasPixelEffects, opacityFx, renderFx, shapeFx, textFx, type FxContext } from './effects';
+import { SPEC } from '../effects';
 import { media } from './media';
 import { buildShape, outlinePoints, type Rect } from './shapes';
 import { drawText, layoutText } from './text';
 import { corners, isActive, isMaskLayer, localBounds, outlineComp, shapeParams, timesOf, withMemo, worldMatrix } from './transform';
-import { activeCamera, depthAt, glMat3, homography, inv3, mul3, projectLocal, type Camera, type Mat3 } from './camera';
+import { activeCamera, apply3, depthAt, glMat3, homography, inv3, mul3, projectLocal, type Camera, type Mat3 } from './camera';
 import { glfx, LUMA_MATTE_FRAG, WARP_FRAG, type Common } from './gl';
 
 export interface RenderOpts {
@@ -524,37 +525,71 @@ export class Renderer {
       k = s * Math.max(Math.max(dist(a, b), dist(d, c)) / lw, Math.max(dist(a, d), dist(b, c)) / lh);
     }
     k = Math.min(4 * s, Math.max(0.02, k));
+    // The plane buffer covers the layer, room for effects to spill over, and
+    // copies an effect places along a path.
+    const area = this.pathArea(f, layer, lt, ec, lb, Hc);
+    const aw = Math.max(1, area.w);
+    const ah = Math.max(1, area.h);
     const fxPad = hasPixelEffects(layer) ? Math.max(lw, lh) * 0.15 + 24 : 0;
     const maxDim = Math.min(4096, Math.ceil(2 * Math.max(W, H)));
     let pad = fxPad + 2 / k;
-    let bw = (lw + 2 * pad) * k;
-    let bh = (lh + 2 * pad) * k;
+    let bw = (aw + 2 * pad) * k;
+    let bh = (ah + 2 * pad) * k;
     const fit = Math.min(1, maxDim / bw, maxDim / bh, Math.sqrt(8e6 / (bw * bh)));
     if (fit < 1) {
       k *= fit;
       pad = fxPad + 2 / k;
-      bw = (lw + 2 * pad) * k;
-      bh = (lh + 2 * pad) * k;
+      bw = (aw + 2 * pad) * k;
+      bh = (ah + 2 * pad) * k;
     }
     const Bw = Math.max(1, Math.ceil(bw));
     const Bh = Math.max(1, Math.ceil(bh));
-    const ox = lb.x - pad;
-    const oy = lb.y - pad;
+    const ox = area.x - pad;
+    const oy = area.y - pad;
     const L = new DOMMatrix([k, 0, 0, k, -k * ox, -k * oy]);
-
-    const src = this.pool.acquire(Bw, Bh);
-    this.drawLayerFx(src.getContext('2d')!, f, layer, lt, ec, L);
-    if (hasPixelEffects(layer)) applyEffects(layer, src, this.fxContext(f, layer, lt, ec, bg, L, k, [Bw, Bh]));
 
     // Output pixel → comp → local plane → source pixel.
     const inv = inv3(Hc);
-    if (inv) {
-      const Lm: Mat3 = [k, 0, -k * ox, 0, k, -k * oy, 0, 0, 1];
-      const Sinv: Mat3 = [1 / s, 0, 0, 0, 1 / s, 0, 0, 0, 1];
-      const M = mul3(Lm, mul3(inv, Sinv));
-      const gl = glfx();
+    const Lm: Mat3 = [k, 0, -k * ox, 0, k, -k * oy, 0, 0, 1];
+    const Sinv: Mat3 = [1 / s, 0, 0, 0, 1 / s, 0, 0, 0, 1];
+    const M = inv ? mul3(Lm, mul3(inv, Sinv)) : null;
+    const gl = glfx();
+
+    const src = this.pool.acquire(Bw, Bh);
+    this.drawLayerFx(src.getContext('2d')!, f, layer, lt, ec, L);
+    if (hasPixelEffects(layer)) {
+      const fx = this.fxContext(f, layer, lt, ec, bg, L, k, [Bw, Bh]);
+      // Effects run in the layer's plane, so inputs drawn in frame space (the
+      // background, referenced layers and paths) are brought into it first.
+      const Minv = M && inv3(M);
+      const held: HTMLCanvasElement[] = [];
+      const toPlane = (c: HTMLCanvasElement | null) => {
+        if (!c || !gl || !Minv) return c;
+        const buf = this.pool.acquire(Bw, Bh);
+        copyInto(buf, gl.run(c, Bw, Bh, [{ frag: WARP_FRAG, u: { u_inv: glMat3(Minv), u_src: [c.width, c.height], u_near: 0 } }], NO_COMMON));
+        held.push(buf);
+        return buf;
+      };
+      let bgPlane: HTMLCanvasElement | null | undefined;
+      applyEffects(layer, src, {
+        ...fx,
+        background: () => (bgPlane === undefined ? (bgPlane = toPlane(fx.background())) : bgPlane),
+        renderRef: (id) => toPlane(fx.renderRef(id)),
+        refPath: (id) => {
+          const pts = fx.refPath(id);
+          if (!pts || !M) return pts;
+          return pts.map(([x, y]) => {
+            const [a, b, w] = apply3(M, x, y);
+            return [a / w, b / w] as Vec2;
+          });
+        },
+      });
+      held.forEach((c) => this.pool.release(c));
+    }
+
+    if (M) {
       if (gl) {
-        copyInto(out, gl.run(src, W, H, [{ frag: WARP_FRAG, u: { u_inv: glMat3(M), u_src: [Bw, Bh] } }], NO_COMMON));
+        copyInto(out, gl.run(src, W, H, [{ frag: WARP_FRAG, u: { u_inv: glMat3(M), u_src: [Bw, Bh], u_near: 1 } }], NO_COMMON));
       } else {
         // Without WebGL: an affine approximation from three projected corners.
         const toOut = (x: number, y: number) => projectLocal(Hc, ox + x / k, oy + y / k);
@@ -571,6 +606,48 @@ export class Renderer {
     }
     this.pool.release(src);
     return out;
+  }
+
+  /**
+   * Local-plane area a 3D layer's buffer must cover: its bounds, grown to
+   * take in copies that effects such as Repeat Along Path place along another
+   * layer's path (or their default circle around the layer).
+   */
+  private pathArea(f: Frame, layer: Layer, lt: number, ec: EvalContext, lb: Rect, Hc: Mat3): Rect {
+    let x0 = lb.x;
+    let y0 = lb.y;
+    let x1 = lb.x + lb.w;
+    let y1 = lb.y + lb.h;
+    const inv = inv3(Hc);
+    for (const e of enabledFx(layer)) {
+      if (!SPEC[e.type]?.refs?.some((r) => r.key === 'path')) continue;
+      // Copies are as big as the layer (times the effect's Scale) around each path point.
+      const half = (Math.max(lb.w, lb.h) * Math.max(1, num(layer, `fx.${e.id}.scale`, lt, ec) / 100)) / 2;
+      const ref = e.refs?.path ? findLayer(f.project, e.refs.path)?.layer : undefined;
+      let pts: Vec2[] = [];
+      if (ref && ref.id !== layer.id && inv) {
+        for (const [x, y] of outlineComp(f.project, ref, f.compT)) {
+          const [u, v, w] = apply3(inv, x, y);
+          if (w > 0) pts.push([u / w, v / w]);
+        }
+      }
+      if (!pts.length) {
+        const r = Math.min(lb.w, lb.h) * 1.2;
+        const cx = lb.x + lb.w / 2;
+        const cy = lb.y + lb.h / 2;
+        pts = [
+          [cx - r, cy - r],
+          [cx + r, cy + r],
+        ];
+      }
+      for (const [u, v] of pts) {
+        x0 = Math.min(x0, u - half);
+        y0 = Math.min(y0, v - half);
+        x1 = Math.max(x1, u + half);
+        y1 = Math.max(y1, v + half);
+      }
+    }
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
   }
 
   private fxContext(f: Frame, layer: Layer, lt: number, ec: EvalContext, bg: HTMLCanvasElement | null, m?: DOMMatrix, scale?: number, size?: [number, number]): FxContext {

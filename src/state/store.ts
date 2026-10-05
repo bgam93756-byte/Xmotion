@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { produce, setAutoFreeze } from 'immer';
 import type { AssetMeta, Bezier, EaseName, Effect, Layer, Project, Prop, PropValue, Vec2 } from '../model/types';
 import { evalPropAt, keyAt, sortKeys, vec, type EvalContext } from '../model/animate';
-import { cloneValue, createEffect, createLayer, defaultZoom, findDef, getProp, propOwner, type PropKind } from '../model/schema';
+import { PROJECT_VERSION, cloneValue, createEffect, createLayer, defaultZoom, findDef, getProp, propOwner, type PropKind } from '../model/schema';
 import { allLayers, ancestors, findLayer, isInside, walk } from '../model/tree';
 import { uid } from '../model/ids';
 import { audioPlayer } from '../engine/audio';
@@ -172,6 +172,8 @@ export function toast(msg: string) {
 
 export function openProject(project: Project) {
   stop();
+  // Groups, masks, 3D and time remapping need version 2; older apps refuse it.
+  if (project.version !== PROJECT_VERSION) project = { ...project, version: PROJECT_VERSION };
   set({ project, past: [], future: [], time: 0, selectedId: null, selection: [], keySel: null, tool: 'select', saveState: 'saved', expanded: {}, sheet: null, graph: null });
 }
 
@@ -312,6 +314,14 @@ function snapshot(p: Project, ids: Iterable<string>, t: number) {
 }
 
 const INEXACT = "Some animated layers couldn't be kept exactly in place; check their keyframes";
+let lastInexact = -Infinity;
+
+/** Tells once (not on every move of a drag) that animated layers were only kept approximately. */
+function warnInexact() {
+  const now = performance.now();
+  if (now - lastInexact > 3000) toast(INEXACT);
+  lastInexact = now;
+}
 
 /** Re-expresses snapshotted layers in their new parent space, on the draft after the tree changed. */
 function restore(d: Project, snap: ReturnType<typeof snapshot>, t: number) {
@@ -320,7 +330,7 @@ function restore(d: Project, snap: ReturnType<typeof snapshot>, t: number) {
     const l = layerById(d, id);
     if (l && !rebase(l, s.parent, parentMatrix(d, l, t), s.lt, s.ec)) exact = false;
   }
-  if (!exact) toast(INEXACT);
+  if (!exact) warnInexact();
 }
 
 /**
@@ -395,15 +405,19 @@ function insertLayers(layers: Layer[], at?: { group: string | null; index: numbe
     }
     list.splice(Math.max(0, Math.min(list.length, target.index)), 0, ...layers);
   });
-  if (!exact) toast(INEXACT);
+  if (!exact) warnInexact();
   const ids = layers.map((l) => l.id);
   set({ selectedId: ids[0], selection: ids.length > 1 ? ids : [], keySel: null });
   reveal(ids[0]);
 }
 
-/** Adds a layer above the selected one (or at `at`). */
-export function addLayer(layer: Layer, at?: { group: string | null; index: number }) {
-  insertLayers([layer], at);
+/**
+ * Adds a layer above the selected one (or at `at`). A layer made in comp
+ * coordinates is re-expressed in its group's space; pass `compSpace` false
+ * when it is already in the target container's space.
+ */
+export function addLayer(layer: Layer, at?: { group: string | null; index: number }, compSpace = true) {
+  insertLayers([layer], at, compSpace);
 }
 
 export function patchLayer(id: string, patch: Partial<Layer>, merge?: string) {
@@ -484,18 +498,25 @@ export function duplicateLayer(id: string) {
   duplicateLayers([id]);
 }
 
+/** Duplicates layers next to the originals, in whichever groups they are (one undo step). */
 export function duplicateLayers(ids: string[]) {
   const p = get().project;
   if (!p) return;
-  const found = ids.map((id) => findLayer(p, id)).filter((f): f is NonNullable<typeof f> => !!f);
-  if (!found.length) return;
-  const f0 = found[0];
-  const same = found.filter((f) => f.list === f0.list).sort((a, b) => a.index - b.index);
-  insertLayers(
-    cloneLayers(same.map((f) => f.layer)),
-    { group: f0.group?.id ?? null, index: same[0].index },
-    false,
-  );
+  const lists = new Map<Layer[], { group: string | null; index: number; layers: Layer[] }>();
+  for (const l of topLevelSelection(p, ids)) {
+    const f = findLayer(p, l.id)!;
+    const entry = lists.get(f.list) ?? { group: f.group?.id ?? null, index: f.index, layers: [] };
+    entry.index = Math.min(entry.index, f.index);
+    entry.layers.push(l);
+    lists.set(f.list, entry);
+  }
+  const plan = [...lists.values()].map((e) => ({ ...e, layers: cloneLayers(e.layers) }));
+  if (!plan.length) return;
+  update((d) => {
+    for (const e of plan) listOf(d, e.group).splice(e.index, 0, ...e.layers);
+  });
+  const ids2 = plan.flatMap((e) => e.layers.map((l) => l.id));
+  set({ selectedId: ids2[0], selection: ids2.length > 1 ? ids2 : [], keySel: null });
 }
 
 /** Moves a layer within its container (index 0 = top). */
@@ -668,7 +689,7 @@ export function bakeToComp(p: Project, layers: Layer[], t: number): Layer[] {
     c.parent = null;
     return c;
   });
-  if (!exact) toast(INEXACT);
+  if (!exact) warnInexact();
   return out;
 }
 
@@ -729,6 +750,9 @@ export function pasteLayer() {
   if (clip) void insertClip(clip);
 }
 
+/** Cameras and audio don't draw, so effects would be invisible (and a camera would move). */
+export const takesEffects = (l: Layer) => l.type !== 'camera' && l.type !== 'audio';
+
 export function copyEffects(layerId: string, effectId?: string) {
   const p = get().project;
   const l = p && layerById(p, layerId);
@@ -741,7 +765,9 @@ export function copyEffects(layerId: string, effectId?: string) {
 
 export function pasteEffects(layerId: string) {
   const fx = get().fxClipboard;
-  if (!fx?.length) return;
+  const target = get().project && layerById(get().project!, layerId);
+  if (!fx?.length || !target) return;
+  if (!takesEffects(target)) return toast(`${target.type === 'camera' ? 'Cameras' : 'Audio layers'} can't have effects`);
   update((p) => {
     const l = layerById(p, layerId);
     if (!l) return;
@@ -803,11 +829,25 @@ export function resetProp(layerId: string, path: string) {
     const l = layerById(p, layerId);
     const def = l && findDef(l, path);
     const o = l && propOwner(l, path);
-    if (def && o) o.owner[o.key] = { value: cloneValue(value ?? def.def) };
+    // A remap of 0 would freeze the clip; its neutral state is the identity.
+    if (l && path === 'timeRemap') identityRemap(l, p.fps);
+    else if (def && o) o.owner[o.key] = { value: cloneValue(value ?? def.def) };
   });
 }
 
 /* ---------------- time remapping, 3D, anchor ---------------- */
+
+/** Time remap keys 0→0 and end→end: the clip plays as if not remapped. */
+function identityRemap(l: Layer, fps: number) {
+  const dur = Math.round((l.end - l.start) * fps) / fps;
+  l.props.timeRemap = {
+    value: 0,
+    keys: [
+      { id: uid('k'), t: 0, v: 0, ease: 'linear' },
+      { id: uid('k'), t: dur, v: dur, ease: 'linear' },
+    ],
+  };
+}
 
 /** Turns time remapping on (keys 0→0 and end→end, so nothing changes yet) or off. */
 export function setTimeRemap(layerId: string, on: boolean) {
@@ -815,52 +855,54 @@ export function setTimeRemap(layerId: string, on: boolean) {
     const l = layerById(p, layerId);
     if (!l) return;
     l.timeRemapOn = on;
-    if (!on) {
-      delete l.props.timeRemap;
-      return;
-    }
-    const dur = Math.round((l.end - l.start) * p.fps) / p.fps;
-    l.props.timeRemap = {
-      value: 0,
-      keys: [
-        { id: uid('k'), t: 0, v: 0, ease: 'linear' },
-        { id: uid('k'), t: dur, v: dur, ease: 'linear' },
-      ],
-    };
+    if (on) identityRemap(l, p.fps);
+    else delete l.props.timeRemap;
   });
   if (on) set({ expanded: { ...get().expanded, [layerId]: true } });
 }
 
 /**
  * Moves the anchor point (pivot) to a new local position and moves the layer
- * so nothing shifts on screen. Animated positions shift every keyframe.
+ * so nothing shifts on screen. A keyframed anchor shifts as a whole; position
+ * follows at every keyframe (exact unless rotation, scale or skew are animated).
  */
 export function setAnchor(layerId: string, anchor: Vec2, merge?: string) {
   const { project: p, time } = get();
   const l = p && layerById(p, layerId);
   if (!p || !l) return;
   const { ec, lt } = timesOf(p, l, time);
-  const m = localMatrix(l, lt, ec, p, time);
   const old = vec(l, 'anchor', lt, ec);
-  const a = m.transformPoint(new DOMPoint(old[0], old[1]));
-  const b = m.transformPoint(new DOMPoint(anchor[0], anchor[1]));
-  const d: [number, number, number] = [b.x - a.x, b.y - a.y, b.z - a.z];
+  const da: Vec2 = [anchor[0] - old[0], anchor[1] - old[1]];
+  if (!da[0] && !da[1]) return;
+  // Where the pivot change lands in parent space at layer time t: the layer's
+  // rotation, skew and scale applied to it.
+  const shiftAt = (t: number): [number, number, number] => {
+    const m = localMatrix(l, t, ec, undefined, undefined, false);
+    const a = m.transformPoint(new DOMPoint(old[0], old[1]));
+    const b = m.transformPoint(new DOMPoint(old[0] + da[0], old[1] + da[1]));
+    return [b.x - a.x, b.y - a.y, b.z - a.z];
+  };
+  const linearKeys = ['rotation', 'scale', 'skew', 'skewAxis', ...(l.threeD ? ['rotX', 'rotY'] : [])].filter((k) => getProp(l, k).keys?.length);
+  const now = shiftAt(lt);
+  const at = (keyT?: number) => (keyT === undefined || !linearKeys.length ? now : shiftAt(l.start + keyT));
   update((pp) => {
     const dl = layerById(pp, layerId);
     if (!dl) return;
     const pos = (dl.props.position ??= { value: cloneValue(getProp(dl, 'position').value) });
-    const move = (v: PropValue) => [round2((v as Vec2)[0] + d[0]), round2((v as Vec2)[1] + d[1])] as Vec2;
-    pos.value = move(pos.value);
-    pos.keys?.forEach((k) => (k.v = move(k.v)));
-    if (dl.threeD && Math.abs(d[2]) > 1e-6) {
-      const z = (dl.props.z ??= { value: 0 });
-      z.value = round2((z.value as number) + d[2]);
-      z.keys?.forEach((k) => (k.v = round2((k.v as number) + d[2])));
+    const move = (v: PropValue, d: number[]) => [round2((v as Vec2)[0] + d[0]), round2((v as Vec2)[1] + d[1])] as Vec2;
+    pos.value = move(pos.value, now);
+    pos.keys?.forEach((k) => (k.v = move(k.v, at(k.t))));
+    if (dl.threeD) {
+      const z = (dl.props.z ??= { value: getProp(dl, 'z').value });
+      z.value = round2((z.value as number) + now[2]);
+      z.keys?.forEach((k) => (k.v = round2((k.v as number) + at(k.t)[2])));
     }
     const an = (dl.props.anchor ??= { value: [0, 0] });
-    if (an.keys?.length) writeValue(pp, dl, 'anchor', anchor, time);
-    else an.value = [round2(anchor[0]), round2(anchor[1])];
+    const shiftAnchor = (v: PropValue) => [round2((v as Vec2)[0] + da[0]), round2((v as Vec2)[1] + da[1])] as Vec2;
+    an.value = an.keys?.length ? shiftAnchor(an.value) : [round2(anchor[0]), round2(anchor[1])];
+    an.keys?.forEach((k) => (k.v = shiftAnchor(k.v)));
   }, merge);
+  if (linearKeys.length) warnInexact();
 }
 
 /** Re-parents a layer (to a sibling) while keeping it visually in place. */
@@ -1022,7 +1064,8 @@ export function setExpr(layerId: string, path: string, expr: string | undefined)
 
 export function addEffect(layerId: string, type: string) {
   update((p) => {
-    layerById(p, layerId)?.effects.push(createEffect(type));
+    const l = layerById(p, layerId);
+    if (l && takesEffects(l)) l.effects.push(createEffect(type));
   });
 }
 

@@ -140,7 +140,8 @@ export function localMatrix(layer: Layer, lt: number, ctx: EvalContext, project?
   const is3D = (layer.threeD && layer.type !== 'group') || layer.type === 'camera';
   let fsx = 1;
   let fsy = 1;
-  if (withFx && layer.effects.length) {
+  // Cameras take no effects (a stray Spin would roll the view).
+  if (withFx && layer.effects.length && layer.type !== 'camera') {
     const fx = transformFx(layer, lt, ctx);
     px += fx.dx;
     py += fx.dy;
@@ -245,7 +246,13 @@ export function localBounds(layer: Layer, lt: number, ctx: EvalContext, compT?: 
 /** Union of a group's (active, visible) children, in the group's local space. */
 function groupBounds(project: Project, group: Layer, compT: number): Rect {
   const kids = group.children ?? [];
-  if (!kids.length) return { x: -40, y: -40, w: 80, h: 80 };
+  // Nothing to show yet: a small box around the group's pivot.
+  const empty = (): Rect => {
+    const { ec, lt } = timesOf(project, group, compT);
+    const [ax, ay] = vec(group, 'anchor', lt, ec);
+    return { x: ax - 40, y: ay - 40, w: 80, h: 80 };
+  };
+  if (!kids.length) return empty();
   const inv = worldMatrix(project, group, compT).inverse();
   let x0 = Infinity,
     y0 = Infinity,
@@ -264,7 +271,7 @@ function groupBounds(project: Project, group: Layer, compT: number): Rect {
       y1 = Math.max(y1, y);
     }
   }
-  if (!Number.isFinite(x0)) return { x: -40, y: -40, w: 80, h: 80 };
+  if (!Number.isFinite(x0)) return empty();
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 

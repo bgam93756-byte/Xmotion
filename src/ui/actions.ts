@@ -42,11 +42,16 @@ export function addSpecial(type: Extract<LayerType, 'null' | 'adjustment' | 'cam
   if (type === 'group') {
     // An empty group spans the whole comp and pivots on its position, so its
     // transform is identity and layers moved into it later stay where they are.
+    // Built in its container's space: the comp center seen from that group.
     const c: Vec2 = [Math.round(p.width / 2), Math.round(p.height / 2)];
     const g = findLayer(p, selectedId)?.group;
     const q = g ? worldMatrix(p, g, time).inverse().transformPoint(new DOMPoint(c[0], c[1])) : null;
-    const anchor: Vec2 = q && !Number.isNaN(q.x) ? [Math.round(q.x * 100) / 100, Math.round(q.y * 100) / 100] : c;
-    Object.assign(opts, { start: 0, end: p.duration, props: { position: { value: c }, anchor: { value: anchor } } });
+    const at: Vec2 = q && !Number.isNaN(q.x) ? [Math.round(q.x * 100) / 100, Math.round(q.y * 100) / 100] : c;
+    Object.assign(opts, { start: 0, end: p.duration, props: { position: { value: at }, anchor: { value: [...at] as Vec2 } } });
+    addLayer(createLayer(p, type, opts), undefined, false);
+    openSheet(null);
+    haptic();
+    return;
   }
   // A camera films the whole comp, so it goes on top of the root (the top-most camera wins).
   addLayer(createLayer(p, type, opts), type === 'camera' ? { group: null, index: 0 } : undefined);

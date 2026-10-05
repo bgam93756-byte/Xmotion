@@ -91,6 +91,10 @@ export async function insertElement(rec: ElementRecord) {
 }
 
 export async function removeElement(id: string) {
-  await deleteElement(id);
+  // Undo/redo can bring back layers that use the element's media, so the open
+  // project's whole history keeps its assets.
+  const { project, past, future } = useEditor.getState();
+  const keep = [project, ...past, ...future].flatMap((p) => p?.assets.map((a) => a.id) ?? []);
+  await deleteElement(id, keep);
   listeners.forEach((fn) => fn());
 }

@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Layer, Project, Vec2 } from '../model/types';
-import { evalPropAt, keyedValue, num, vec } from '../model/animate';
+import { evalPropAt, keyedValue, vec } from '../model/animate';
 import { getProp } from '../model/schema';
 import { allLayers, findLayer, isInside } from '../model/tree';
 import { flat, is3DLayer, isMask, Renderer } from '../engine/renderer';
+import { transformFx } from '../engine/effects';
 import { media } from '../engine/media';
 import { onFontsChanged } from '../engine/fonts';
 import { simplify, type Rect } from '../engine/shapes';
@@ -704,12 +705,18 @@ export function Viewport() {
       const hi = pts.findIndex((h) => dist(pt, h) < HANDLE);
       if (hi >= 0) {
         const s0 = evalPropAt(sel, 'scale', propClock(p, sel, 'scale', t), ec) as Vec2;
-        const pos = vec(sel, 'position', lt, ec);
-        const rot = num(sel, 'rotation', lt, ec);
-        const base = flat(parentMatrix(p, sel, t)).translate(pos[0], pos[1]).rotate(rot);
-        const h0: Vec2 = [((cs[hi][0] - anchor[0]) * s0[0]) / 100, ((cs[hi][1] - anchor[1]) * s0[1]) / 100];
-        drag.current = { kind: 'scale', layer: sel.id, s0, h0, base, gid };
-        return;
+        // The space just before scaling: the world matrix with the anchor offset
+        // and the scale (property × transform effects) taken back out. It keeps
+        // rotation, skew and effect offsets, so the handle stays under the finger.
+        const fx = sel.effects.length ? transformFx(sel, lt, ec) : { sx: 1, sy: 1 };
+        const kx = (s0[0] / 100) * fx.sx;
+        const ky = (s0[1] / 100) * fx.sy;
+        if (Math.abs(kx) > 1e-6 && Math.abs(ky) > 1e-6) {
+          const base = m.translate(anchor[0], anchor[1]).scale(1 / kx, 1 / ky);
+          const h0: Vec2 = [(cs[hi][0] - anchor[0]) * kx, (cs[hi][1] - anchor[1]) * ky];
+          drag.current = { kind: 'scale', layer: sel.id, s0, h0, base, gid };
+          return;
+        }
       }
     }
     const hit = pick(p, c, t, s.selectedId);
