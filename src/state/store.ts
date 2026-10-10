@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { produce, setAutoFreeze } from 'immer';
-import type { AssetMeta, Bezier, EaseName, Effect, Layer, Project, Prop, PropValue, Vec2 } from '../model/types';
+import type { AssetMeta, Bezier, EaseName, Effect, Keyframe, Layer, Project, Prop, PropValue, Vec2 } from '../model/types';
 import { evalPropAt, keyAt, sortKeys, vec, type EvalContext } from '../model/animate';
 import { PROJECT_VERSION, cloneValue, createEffect, createLayer, defaultZoom, findDef, getProp, propOwner, type PropKind } from '../model/schema';
 import { allLayers, ancestors, findLayer, isInside, walk } from '../model/tree';
@@ -252,10 +252,17 @@ export function redo() {
 }
 
 function fixSelection() {
-  const { project, selectedId, selection } = get();
+  const { project, selectedId, selection, keySel } = get();
   const exists = (id: string) => !!project && !!findLayer(project, id);
   if (selectedId && !exists(selectedId)) set({ selectedId: null, keySel: null });
   if (selection.some((id) => !exists(id))) set({ selection: selection.filter(exists) });
+  if (keySel && !selectedKey(get().project, keySel)) set({ keySel: null });
+}
+
+/** The selected keyframe while it still exists (undo, or removing keys at the playhead, can take it away). */
+export function selectedKey(project: Project | null, keySel: KeySel | null): Keyframe | undefined {
+  const l = project && keySel ? layerById(project, keySel.layerId) : undefined;
+  return l && keySel ? getProp(l, keySel.path).keys?.find((k) => k.id === keySel.keyId) : undefined;
 }
 
 export function layerById(p: Project, id: string | null | undefined): Layer | undefined {

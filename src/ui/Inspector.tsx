@@ -26,6 +26,7 @@ import {
   moveLayer,
   openSheet,
   pasteEffects,
+  selectedKey,
   patchLayer,
   select,
   selectedIds,
@@ -355,8 +356,8 @@ export function CategoryBody({ project, layer, id }: { project: Project; layer: 
 /** Phones: the open category of the selected layer, under the timeline. */
 export function CategoryPanel({ project, layer }: { project: Project; layer: Layer }) {
   const tab = useEditor((s) => s.propTab);
-  const keySel = useEditor((s) => s.keySel);
-  const cats = layerCategories(layer, keySel?.layerId === layer.id);
+  const keyHere = useEditor((s) => s.keySel?.layerId === layer.id && !!selectedKey(s.project, s.keySel));
+  const cats = layerCategories(layer, keyHere);
   const cat = cats.find((c) => c.id === tab) ?? cats.find((c) => c.id !== 'keyframe') ?? cats[0];
   return (
     <div className="cat-panel">
@@ -375,7 +376,7 @@ export function CategoryPanel({ project, layer }: { project: Project; layer: Lay
 
 /** Wide screens: every category of the layer, stacked. */
 function LayerPanel({ project, layer }: { project: Project; layer: Layer }) {
-  const keySel = useEditor((s) => s.keySel);
+  const keyHere = useEditor((s) => s.keySel?.layerId === layer.id && !!selectedKey(s.project, s.keySel));
   // Stacking order within the layer's own container (root or group).
   const found = findLayer(project, layer.id);
   const idx = found?.index ?? 0;
@@ -399,7 +400,7 @@ function LayerPanel({ project, layer }: { project: Project; layer: Layer }) {
           <span className="ellipsis">In {pathLabel(project, found.group)}</span>
         </button>
       )}
-      {keySel?.layerId === layer.id && (
+      {keyHere && (
         <Section title="Keyframe" id="keyframe">
           <KeyframeBody project={project} layer={layer} />
         </Section>

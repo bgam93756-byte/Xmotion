@@ -420,10 +420,11 @@ function NewProjectSheet({ onClose, onCreate }: { onClose: () => void; onCreate:
   );
 }
 
+/** "9.5s", "42s", "2:05". */
 function formatDuration(s: number) {
-  const m = Math.floor(s / 60);
-  const r = s - m * 60;
-  return m ? `${m}:${String(Math.round(r)).padStart(2, '0')}` : `${r.toFixed(r < 10 ? 1 : 0)}s`;
+  const t = Math.round(s);
+  if (t < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
+  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
 }
 
 function safeThumb(p: Project, t = 1.5): string | undefined {

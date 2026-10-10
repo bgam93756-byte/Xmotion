@@ -18,6 +18,7 @@ import {
   redo,
   select,
   selectedIds,
+  selectedKey,
   setTime,
   splitLayer,
   stepFrames,
@@ -298,7 +299,7 @@ function CategoryBar() {
   const selection = useEditor((s) => s.selection);
   const sheet = useEditor((s) => s.sheet);
   const tab = useEditor((s) => s.propTab);
-  const keyHere = useEditor((s) => !!s.keySel && s.keySel.layerId === s.selectedId);
+  const keyHere = useEditor((s) => !!s.keySel && s.keySel.layerId === s.selectedId && !!selectedKey(s.project, s.keySel));
   const barRef = useRef<HTMLElement>(null);
   const layer = selection.length > 1 ? undefined : layerById(project, selectedId);
   const cats = layer ? layerCategories(layer, keyHere) : [];
@@ -348,13 +349,24 @@ function PhonePanel() {
   return layer ? <CategoryPanel project={project} layer={layer} /> : null;
 }
 
-/** Android back button: close what is open, step out of the selection, then leave the project. */
+/**
+ * Android back button: close what is open, step out of the selection, then
+ * leave the project. A panel that is set but not on screen (the properties
+ * panel on wide screens or with several layers selected, the graph of a
+ * deleted layer) closes along the way, so every press changes something.
+ */
 function useEditorBack() {
   useBackHandler(true, () => {
     const s = useEditor.getState();
-    if (s.sheet) return openSheet(null);
+    const p = s.project;
+    const single = s.selection.length <= 1 && !!p && !!layerById(p, s.selectedId);
+    if (s.sheet && (s.sheet !== 'props' || (single && !isWideScreen()))) return openSheet(null);
+    if (s.sheet) openSheet(null);
     if (s.tool !== 'select') return useEditor.setState({ tool: 'select' });
-    if (s.graph) return openGraph(null);
+    if (s.graph) {
+      openGraph(null);
+      if (p && findLayer(p, s.graph.layerId)) return;
+    }
     if (s.selectedId || s.selection.length) return select(null);
     void leaveEditor();
   });
@@ -469,7 +481,7 @@ function useShortcuts() {
       if (!sel) return;
       if (k === 'delete' || k === 'backspace') {
         handled();
-        if (s.keySel) deleteKey(s.keySel);
+        if (s.keySel && selectedKey(p, s.keySel)) deleteKey(s.keySel);
         else deleteSelection();
         return;
       }
