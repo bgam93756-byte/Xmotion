@@ -20,28 +20,42 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
+export const isAndroid = Capacitor.getPlatform() === 'android';
+
+/** Writes a blob to the app's folders in chunks (long videos don't need one giant base64 string). */
+async function writeExport(blob: Blob, path: string, directory: Directory): Promise<string> {
+  const CHUNK = 3 * 1024 * 1024;
+  for (let off = 0; off < blob.size || off === 0; off += CHUNK) {
+    const data = await blobToBase64(blob.slice(off, off + CHUNK));
+    if (off === 0) await Filesystem.writeFile({ path, data, directory, recursive: true });
+    else await Filesystem.appendFile({ path, data, directory });
+    if (blob.size === 0) break;
+  }
+  return (await Filesystem.getUri({ path, directory })).uri;
+}
+
 /**
- * Saves an exported file. On iOS it is written to the app's Documents folder
- * (visible in the Files app) and the share sheet opens so it can go to Photos,
- * TikTok, Instagram, etc. On the web it downloads, or uses the Web Share API on phones.
+ * Saves an exported file. In the apps it is written to the Documents folder
+ * (iOS: Files › Xmotion › Exports; Android: Documents/Exports, also listed in
+ * the gallery) and the share sheet opens so it can go to Photos, TikTok,
+ * Instagram, etc. On the web it downloads, or uses the Web Share API on phones.
  */
 export async function saveFile(blob: Blob, filename: string): Promise<'shared' | 'downloaded' | 'saved'> {
   if (isNative) {
-    // Write in chunks so long videos don't need one giant base64 string.
-    const CHUNK = 3 * 1024 * 1024;
     const path = `Exports/${filename}`;
-    for (let off = 0; off < blob.size || off === 0; off += CHUNK) {
-      const data = await blobToBase64(blob.slice(off, off + CHUNK));
-      if (off === 0) await Filesystem.writeFile({ path, data, directory: Directory.Documents, recursive: true });
-      else await Filesystem.appendFile({ path, data, directory: Directory.Documents });
-      if (blob.size === 0) break;
+    let uri: string;
+    try {
+      uri = await writeExport(blob, path, Directory.Documents);
+    } catch (e) {
+      // Android 10 and older without storage permission: share it from the app's cache instead.
+      if (!isAndroid) throw e;
+      uri = await writeExport(blob, path, Directory.Cache);
     }
-    const { uri } = await Filesystem.getUri({ path, directory: Directory.Documents });
     try {
       await Share.share({ title: filename, files: [uri] });
       return 'shared';
     } catch {
-      // User dismissed the share sheet; the file is still in Files › Xmotion › Exports.
+      // User dismissed the share sheet; the file is still in the Exports folder.
       return 'saved';
     }
   }

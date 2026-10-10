@@ -1,11 +1,14 @@
 import type { Layer } from '../model/types';
+import { findLayer } from '../model/tree';
 import {
   copyEffects,
   copyLayers,
   duplicateLayers,
   groupLayers,
   layerById,
+  moveLayer,
   openSheet,
+  patchLayer,
   pasteEffects,
   takesEffects,
   pasteLayer,
@@ -41,8 +44,20 @@ export function MoreSheet() {
   const layers = ids.map((id) => layerById(project, id)).filter((l): l is Layer => !!l);
   const single = layers.length === 1 ? layers[0] : undefined;
   const none = !layers.length;
+  // Stacking order within the layer's own container (root or group).
+  const at = single ? findLayer(project, single.id) : null;
 
   const actions: (Action | null)[] = [
+    single
+      ? {
+          icon: 'edit',
+          label: 'Rename',
+          run: () => {
+            const name = window.prompt('Layer name', single.name);
+            if (name !== null && name.trim()) patchLayer(single.id, { name: name.trim() });
+          },
+        }
+      : null,
     { icon: 'copy', label: 'Copy', keys: `${MOD}C`, disabled: none, run: () => copyLayers(ids) },
     { icon: 'paste', label: 'Paste', keys: `${MOD}V`, disabled: !hasClip, run: pasteLayer },
     { icon: 'layers', label: 'Duplicate', keys: `${MOD}D`, disabled: none, run: () => duplicateLayers(ids) },
@@ -51,6 +66,8 @@ export function MoreSheet() {
     single?.type === 'group' ? { icon: 'ungroup', label: 'Ungroup', keys: `${MOD}Shift+G`, run: () => ungroup(single.id) } : null,
     single && takesEffects(single) ? { icon: 'fx', label: 'Copy effects', disabled: !single.effects.length, run: () => copyEffects(single.id) } : null,
     single && takesEffects(single) ? { icon: 'fx', label: 'Paste effects', disabled: !hasFx, run: () => pasteEffects(single.id) } : null,
+    single && at ? { icon: 'up', label: 'Bring forward', keys: `${MOD}]`, disabled: at.index === 0, run: () => moveLayer(single.id, at.index - 1) } : null,
+    single && at ? { icon: 'down', label: 'Send backward', keys: `${MOD}[`, disabled: at.index === at.list.length - 1, run: () => moveLayer(single.id, at.index + 1) } : null,
     { icon: 'bookmark', label: 'Save as element', disabled: none, run: () => void saveSelectionAsElement() },
     { icon: 'cursor', label: 'Select all', keys: `${MOD}A`, stay: true, run: selectAll },
     { icon: 'trash', label: 'Delete', keys: 'Del', disabled: none, danger: true, run: deleteSelection },

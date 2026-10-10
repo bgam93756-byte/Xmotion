@@ -1,6 +1,8 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { Capacitor } from '@capacitor/core';
 import { App } from './ui/App';
+import { runBackHandler } from './ui/back';
 import { isNative } from './platform';
 import './styles.css';
 
@@ -12,6 +14,15 @@ createRoot(document.getElementById('root')!).render(
     <App />
   </StrictMode>,
 );
+
+// Android back button: close the newest sheet or panel, step out of the editor, then leave the app.
+if (Capacitor.getPlatform() === 'android') {
+  void import('@capacitor/app').then(({ App: NativeApp }) =>
+    NativeApp.addListener('backButton', () => {
+      if (!runBackHandler()) void NativeApp.exitApp();
+    }),
+  );
+}
 
 // Offline support for the web version (the iOS app bundles its files already).
 if (!isNative && 'serviceWorker' in navigator && location.protocol === 'https:') {
@@ -33,8 +44,9 @@ if (location.search.includes('debug')) {
     import('./engine/transform'),
     import('./model/tree'),
     import('./engine/camera'),
+    import('./ui/back'),
   ]).then(
-    ([store, fx, renderer, schema, media, gl, transform, tree, camera]) => {
+    ([store, fx, renderer, schema, media, gl, transform, tree, camera, back]) => {
       (window as unknown as Record<string, unknown>).__xm = {
         ...store,
         EFFECT_LIST: fx.EFFECT_LIST,
@@ -45,6 +57,7 @@ if (location.search.includes('debug')) {
         transform,
         tree,
         camera,
+        back: back.runBackHandler,
       };
     },
   );

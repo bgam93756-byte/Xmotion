@@ -221,7 +221,8 @@ export function createEffect(type: string): Effect {
   return { id: uid('fx'), type, enabled: true, props };
 }
 
-function nextName(project: Project, base: string): string {
+/** "Base 1", "Base 2"…: the first name not used by a layer yet. */
+export function nextName(project: Project, base: string): string {
   let n = 1;
   const names = new Set(allLayers(project).map((l) => l.name));
   while (names.has(`${base} ${n}`)) n++;

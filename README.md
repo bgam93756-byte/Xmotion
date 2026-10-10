@@ -1,6 +1,15 @@
 # Xmotion
 
-A keyframe motion-graphics and video editor for **iPhone and iPad** (also runs in any modern browser). It's built to compete with Alight Motion: layers, keyframes, curves, GPU effects and real video export, with no watermark and no subscription.
+A keyframe motion-graphics and video editor for **iPhone, iPad and Android** (also runs in any modern browser). It's built to compete with Alight Motion: layers, keyframes, curves, GPU effects and real video export, with no watermark and no subscription.
+
+It works like Alight Motion:
+- A round **+** button adds layers: Shapes, Image & Video, Audio, Text, Drawing, Elements, Camera, Group, Null, Adjustment and Font.
+- Selecting a layer shows its actions (Split, Duplicate, Delete, More) and a bar of property categories: **Move & Transform, Effects, Color & Fill, Border & Shadow, Blending & Opacity**, plus Shape, Edit text or Media, Animate and Timing. Tap one to open its panel under the timeline.
+- Each panel's ◆ keyframes its main properties at once.
+- Effects are browsed by category, with search.
+- Gestures: drag a layer to move it, put two fingers on a layer to move, scale and rotate it at once, and pinch the empty canvas to zoom.
+
+The code and design are Xmotion's own; it doesn't contain any Alight Motion code or assets.
 
 ## Features
 
@@ -14,13 +23,13 @@ A keyframe motion-graphics and video editor for **iPhone and iPad** (also runs i
 - **Transform:** position, scale, rotation, opacity, skew with a skew axis, and an anchor point (pivot) you can drag with the **Anchor tool** or snap to 9 presets without the layer moving.
 - **Parenting:** parent a layer to another layer or a null in the same group; it follows the parent's position, rotation and scale.
 - **Copy and paste:** layers (between projects too, media included), effects, and single property values or keyframes (tap a property's name for **Copy / Paste / Reset / Show in graph editor**).
-- **Elements:** save layers or groups to a library on the device and drop them into any project from **Add › Elements**.
+- **Elements:** save layers or groups to a library on the device and drop them into any project from **+ › Elements**. The Home screen's **Elements** tab lists them.
 - **Grid, guides and snapping:** grid, rule of thirds, title/action safe areas, draggable guides, and snapping to the comp, guides, grid and other layers.
 - **Motion paths:** shown on the canvas for animated positions.
 - **Expressions (sandboxed):** `wiggle(2, 30)`, `value + time*90`, `loop()`, `pingpong()`, `random()`, `linear()`, vector math and conditions. Project files can't run arbitrary code.
 - **175 effects, covering every effect in Alight Motion's A–Z list** (all 169 names), plus Drop Shadow, Outline, Duotone, Glitch, Scanlines and Color Adjust.
   - Every effect parameter can be keyframed or driven by an expression.
-  - A searchable picker groups them into 13 categories:
+  - The effect browser opens on 13 categories (search finds any effect):
     - Blur & Sharpen (Gaussian, lens, spin, unsharp mask, per-layer motion blur…)
     - Glow & Light (glow, lens flare, lightning, rays, bevel, long shadow, frosted glass…)
     - Color (gradient map, palette map, channel remap, spot color, iridescence…)
@@ -43,7 +52,7 @@ A keyframe motion-graphics and video editor for **iPhone and iPad** (also runs i
 - **One-tap animation presets:** In, Out, Loop and Text.
 - **Timeline:**
   - Swipe to scrub with a fixed center playhead, and pinch to zoom.
-  - On phones the timeline stays on screen while you edit properties (they open below it).
+  - On phones the timeline stays on screen while you edit properties (the panels open below it). Held sideways, the preview sits on the left and the timeline and panels on the right.
   - Drag clips to move them; trim handles keep the content in place.
   - Drag layers by their icon to reorder them or move them into and out of groups.
   - Split, duplicate, and copy/paste layers.
@@ -51,7 +60,7 @@ A keyframe motion-graphics and video editor for **iPhone and iPad** (also runs i
   - MP4 (H.264), WebM, GIF, PNG, and PNG or JPEG image sequences (zipped), up to 4K and 120 fps.
   - Rendered frame by frame, so frames are exact and every effect is included.
   - Audio from videos and music is mixed in, with volume and fades.
-  - On iPhone, the finished file opens the share sheet, so you can save it to Photos or post it to TikTok/Instagram. It's also saved in Files › Xmotion › Exports.
+  - In the apps, the finished file opens the share sheet, so you can save it to Photos or your gallery or post it to TikTok/Instagram. On iPhone it's also saved in Files › Xmotion › Exports, and on Android in Documents/Exports.
 - **Projects:** autosaved on the device, with templates included. You can share a project as an `.xmotion` file (media embedded) and import it on another device.
 - **Other:** undo/redo, keyboard shortcuts for iPad keyboards and desktop (Ctrl+G group, Ctrl+Shift+G ungroup, Y anchor tool and more), drag-and-drop import on desktop, and a **Learn** path in Help (Keyframes → Easing → Graphs → Parenting → Nulls → Masks → Blending → Camera → Motion Blur → Effects).
 
@@ -80,6 +89,25 @@ npm run ios        # builds the web app, syncs it into ios/, opens Xcode
 ```
 
 In Xcode, select your Team under the **App** target's *Signing & Capabilities*, choose your iPhone and press **Run**.
+
+## Get the Android app (.apk)
+
+1. Open the repo on GitHub, then **Actions › Build Android app (.apk)**. It runs on every push that changes the app (any branch), and you can also start it with **Run workflow**. Builds from `v*` tags are attached to a GitHub Release.
+2. When the run finishes, download the **Xmotion-apk** artifact on your phone and unzip it to get `Xmotion.apk`. Your browser or Files app can unzip it.
+3. Open `Xmotion.apk` and allow your browser or Files app to **install unknown apps** when Android asks.
+
+No computer or account is needed, and the app doesn't expire. Every build is signed with the same key, so a newer `Xmotion.apk` installs over the old one and keeps your projects. Android 7 or later is required. Exports need an up-to-date **Android System WebView** (Chrome 94 or later); update it from the Play Store if exporting fails.
+
+**Signing:** builds use the public sideload key in `android/app/xmotion-sideload.keystore`, which is fine for installing your own builds. To sign with a private key instead, add the repository secrets `XMOTION_KEYSTORE_BASE64` (the keystore file, base64-encoded), `XMOTION_KEYSTORE_PASSWORD`, `XMOTION_KEY_ALIAS` and `XMOTION_KEY_PASSWORD`. Apps signed with a different key can't update each other, so uninstall the old one first (export your projects with **Share project file** before you do).
+
+To build it yourself you need the Android SDK (or Android Studio) and JDK 21:
+
+```bash
+npm install
+npm run android    # builds the web app, syncs it into android/, opens Android Studio
+# or, without Android Studio:
+npm run build && npx cap sync android && cd android && ./gradlew assembleRelease
+```
 
 ## Use it in Safari (no install)
 
@@ -118,13 +146,14 @@ npm run build      # typecheck + production build into dist/
   - `media.ts`: media decoding. `audio.ts`: Web Audio playback and offline mixdown. `storage.ts`: IndexedDB projects and assets.
 - `src/state/store.ts`: zustand store with undo/redo history (immer), keyframe-aware editing, grouping, clipboards and the playback clock. `elements.ts` is the Elements library.
 - `src/ui`: React UI.
-  - Layout is phone-first: preview on top, timeline below, and bottom sheets for properties, adding layers and export.
-  - On iPad landscape and desktop it switches to three panes.
-- `ios/`: the Capacitor iOS shell. Native plugins handle sharing exports, writing files and haptics.
+  - Layout is phone-first, like Alight Motion: preview on top, timeline below with a round + button, and for a selected layer an action bar, a category bar and the open category's panel. Adding layers, effects (`EffectBrowser.tsx`) and export use bottom sheets.
+  - On iPad landscape and desktop it switches to three panes, with every category in the side inspector.
+  - `back.ts` handles the Android back button: it closes the newest sheet or panel first.
+- `ios/` and `android/`: the Capacitor shells. Native plugins handle sharing exports, writing files, haptics and the Android back button.
 
 ## Known limitations
 
-- The iOS app requires **iOS 16.4 or later** (the first iOS with WebCodecs video encoding). On older Safari versions without a native AAC encoder, a bundled WASM AAC encoder is loaded automatically so exports still have sound.
+- The iOS app requires **iOS 16.4 or later** (the first iOS with WebCodecs video encoding). The Android app needs Android 7 or later with an up-to-date System WebView. On older Safari versions without a native AAC encoder, a bundled WASM AAC encoder is loaded automatically so exports still have sound.
 - Google Fonts download on first use; offline, text falls back to the system font until the font has been cached.
 - 3D layers are flat cards: they sort by depth but don't cut through each other, and there are no lights or extruded 3D text. A 2D layer parented to a 3D layer is drawn flat. Groups themselves are 2D (put 3D layers inside them, or parent 3D layers to a 3D null).
 - Audio of time-remapped clips (or clips inside a time-remapped group) is left out of playback and export.

@@ -51,7 +51,9 @@ type Drag =
   | { kind: 'guide'; axis: 'v' | 'h'; index: number; value: number; pt: Vec2; gid: number }
   | { kind: 'pan'; s0: Vec2; pan0: Vec2 }
   | { kind: 'pen'; points: Vec2[] }
-  | { kind: 'pinch'; d0: number; mid0: Vec2; zoom0: number; pan0: Vec2 };
+  | { kind: 'pinch'; d0: number; mid0: Vec2; zoom0: number; pan0: Vec2 }
+  /** Two fingers on the selected layer: move, scale and rotate it together. */
+  | { kind: 'twist'; layer: string; gid: number; d0: number; mid0: Vec2; lastA: number; rot: number; s0: Vec2; r0: number; flip: number; item: MoveItem; cam: Camera | null };
 
 let gestureId = 0;
 const HANDLE = isTouch ? 22 : 10;
@@ -169,6 +171,34 @@ function snapBoxes(p: Project, t: number, moving: Set<string>, cam: () => Camera
   return out;
 }
 
+/** How a comp-space drag maps onto a layer's position (and Z for 3D layers). */
+function moveItem(p: Project, l: Layer, t: number): MoveItem {
+  const { ec, lt } = timesOf(p, l, t);
+  const v0 = evalPropAt(l, 'position', propClock(p, l, 'position', t), ec) as Vec2;
+  const pm = parentMatrix(p, l, t);
+  if (!is3DLayer(l)) return { id: l.id, v0, inv: flat(pm).inverse() };
+  const [ax, ay] = vec(l, 'anchor', lt, ec);
+  const w = worldMatrix(p, l, t).transformPoint(new DOMPoint(ax, ay, 0));
+  const z0 = evalPropAt(l, 'z', propClock(p, l, 'z', t), ec) as number;
+  return { id: l.id, v0, inv: pm.inverse(), z0, at: [w.x, w.y, w.z] };
+}
+
+/** Writes a layer's position for a comp-space drag (dx, dy) from where `it` started. */
+function writeMove(dp: Project, l: Layer, it: MoveItem, cam: Camera | null, dx: number, dy: number, t: number) {
+  if (it.at && cam) {
+    // 3D: drag on the plane facing the camera, then into the parent's space.
+    const w = screenDeltaToWorld(cam, it.at, dx, dy);
+    const a = it.inv.transformPoint(new DOMPoint(it.at[0], it.at[1], it.at[2]));
+    const b = it.inv.transformPoint(new DOMPoint(it.at[0] + w[0], it.at[1] + w[1], it.at[2] + w[2]));
+    writeValue(dp, l, 'position', [round1(it.v0[0] + b.x - a.x), round1(it.v0[1] + b.y - a.y)], t);
+    writeValue(dp, l, 'z', round1((it.z0 ?? 0) + b.z - a.z), t);
+  } else {
+    const nx = it.v0[0] + it.inv.a * dx + it.inv.c * dy;
+    const ny = it.v0[1] + it.inv.b * dx + it.inv.d * dy;
+    writeValue(dp, l, 'position', [round1(nx), round1(ny)], t);
+  }
+}
+
 /** Starts moving layers (several when dragging a multi-selection). */
 function startMove(p: Project, t: number, ids: string[], hit: string, pt: Vec2, c: Vec2, gid: number): Drag | null {
   const moving = new Set(ids);
@@ -181,19 +211,10 @@ function startMove(p: Project, t: number, ids: string[], hit: string, pt: Vec2, 
     if (!l || !canEdit(l)) continue;
     // Layers inside a moving group, or parented to a moving layer, already move with it.
     if (ids.some((o) => o !== id && isInside(p, id, o)) || follows(p, l, moving)) continue;
-    const { ec, lt } = timesOf(p, l, t);
-    const v0 = evalPropAt(l, 'position', propClock(p, l, 'position', t), ec) as Vec2;
-    const pm = parentMatrix(p, l, t);
-    if (is3DLayer(l)) {
-      has3D = true;
-      const [ax, ay] = vec(l, 'anchor', lt, ec);
-      const w = worldMatrix(p, l, t).transformPoint(new DOMPoint(ax, ay, 0));
-      const z0 = evalPropAt(l, 'z', propClock(p, l, 'z', t), ec) as number;
-      items.push({ id, v0, inv: pm.inverse(), z0, at: [w.x, w.y, w.z] });
-    } else {
-      items.push({ id, v0, inv: flat(pm).inverse() });
-      box = unionBox(box, boxOf(compCorners(p, l, t, cam) ?? []));
-    }
+    const it = moveItem(p, l, t);
+    items.push(it);
+    if (it.at) has3D = true;
+    else box = unionBox(box, boxOf(compCorners(p, l, t, cam) ?? []));
   }
   if (!items.length) return null;
   // Box snapping is for 2D moves; 3D layers move in perspective.
@@ -658,12 +679,50 @@ export function Viewport() {
     down.current = null;
   }
 
+  /**
+   * Second finger down while the first one moves the selected layer: from now
+   * on both fingers move, scale and rotate it (two fingers elsewhere zoom the view).
+   */
+  function startTwist(): boolean {
+    const d = drag.current;
+    const s = useEditor.getState();
+    const p = s.project;
+    if (!p || d?.kind !== 'move' || d.items.length !== 1 || d.hit !== s.selectedId || s.selection.length) return false;
+    const l = layerById(p, d.items[0].id);
+    if (!l || !canEdit(l)) return false;
+    const [a, b] = [...pointers.current.values()];
+    const t = s.time;
+    const { ec } = timesOf(p, l, t);
+    // Mirrored parents turn a clockwise twist into a counter-clockwise rotation.
+    const pm = flat(parentMatrix(p, l, t));
+    const lastA = Math.atan2(b[1] - a[1], b[0] - a[0]);
+    drag.current = {
+      kind: 'twist',
+      layer: l.id,
+      gid: d.gid,
+      d0: Math.max(1, dist(a, b)),
+      mid0: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2],
+      lastA,
+      rot: 0,
+      s0: evalPropAt(l, 'scale', propClock(p, l, 'scale', t), ec) as Vec2,
+      r0: evalPropAt(l, 'rotation', propClock(p, l, 'rotation', t), ec) as number,
+      flip: pm.a * pm.d - pm.b * pm.c < 0 ? -1 : 1,
+      // From where the first finger already moved it.
+      item: moveItem(p, l, t),
+      cam: is3DLayer(l) ? activeCamera(p, t) : null,
+    };
+    snapLines.current = null;
+    down.current = null;
+    haptic();
+    return true;
+  }
+
   function onPointerDown(e: React.PointerEvent) {
     const pt = local(e);
     pointers.current.set(e.pointerId, pt);
     wrapRef.current!.setPointerCapture(e.pointerId);
     if (pointers.current.size === 2) {
-      startPinch();
+      if (!startTwist()) startPinch();
       return;
     }
     if (pointers.current.size > 2) return;
@@ -829,6 +888,29 @@ export function Viewport() {
         schedule();
         break;
       }
+      case 'twist': {
+        const [a, b] = [...pointers.current.values()];
+        if (!a || !b) break;
+        const ang = Math.atan2(b[1] - a[1], b[0] - a[0]);
+        // Accumulate the turn so it can go past half a turn.
+        let da = ang - d.lastA;
+        if (da > Math.PI) da -= Math.PI * 2;
+        if (da < -Math.PI) da += Math.PI * 2;
+        d.rot += da;
+        d.lastA = ang;
+        const k = dist(a, b) / d.d0;
+        const c0 = toComp(d.mid0);
+        const c1 = toComp([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]);
+        const t = s.time;
+        update((dp) => {
+          const l = layerById(dp, d.layer);
+          if (!l) return;
+          writeValue(dp, l, 'scale', [round1(d.s0[0] * k), round1(d.s0[1] * k)], t);
+          writeValue(dp, l, 'rotation', round1(d.r0 + (d.flip * d.rot * 180) / Math.PI), t);
+          writeMove(dp, l, d.item, d.cam, c1[0] - c0[0], c1[1] - c0[1], t);
+        }, `drag:${d.gid}`);
+        break;
+      }
       case 'pan':
         view.current = { ...view.current, pan: [d.pan0[0] + pt[0] - d.s0[0], d.pan0[1] + pt[1] - d.s0[1]], fit: false };
         schedule();
@@ -863,19 +945,7 @@ export function Viewport() {
         update((dp) => {
           for (const it of d.items) {
             const l = layerById(dp, it.id);
-            if (!l) continue;
-            if (it.at && d.cam) {
-              // 3D: drag on the plane facing the camera, then into the parent's space.
-              const w = screenDeltaToWorld(d.cam, it.at, dx, dy);
-              const a = it.inv.transformPoint(new DOMPoint(it.at[0], it.at[1], it.at[2]));
-              const b = it.inv.transformPoint(new DOMPoint(it.at[0] + w[0], it.at[1] + w[1], it.at[2] + w[2]));
-              writeValue(dp, l, 'position', [round1(it.v0[0] + b.x - a.x), round1(it.v0[1] + b.y - a.y)], t);
-              writeValue(dp, l, 'z', round1((it.z0 ?? 0) + b.z - a.z), t);
-            } else {
-              const nx = it.v0[0] + it.inv.a * dx + it.inv.c * dy;
-              const ny = it.v0[1] + it.inv.b * dx + it.inv.d * dy;
-              writeValue(dp, l, 'position', [round1(nx), round1(ny)], t);
-            }
+            if (l) writeMove(dp, l, it, d.cam, dx, dy, t);
           }
         }, `drag:${d.gid}`);
         break;
@@ -947,9 +1017,10 @@ export function Viewport() {
     const pt = local(e);
     pointers.current.delete(e.pointerId);
     const d = drag.current;
-    if (d?.kind === 'pinch') {
-      // Lifting one finger of a pinch shouldn't turn into a drag.
+    if (d?.kind === 'pinch' || d?.kind === 'twist') {
+      // Lifting one finger of a pinch or twist shouldn't turn into a drag.
       drag.current = null;
+      if (d.kind === 'twist') endMerge();
       return;
     }
     if (d?.kind === 'pen') {

@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react';
 import { MAX_SEQUENCE_FRAMES, exportProject, frameCount, isSequence, supportsVideoExport, type ExportFormat, type ExportQuality } from '../engine/exporter';
 import { stop, useEditor } from '../state/store';
-import { canShareFiles, saveFile, isNative } from '../platform';
+import { canShareFiles, isAndroid, saveFile, isNative } from '../platform';
 import { Icon } from './icons';
 import { Toggle } from './controls/fields';
 
@@ -106,7 +106,8 @@ export function ExportSheet() {
         <p className="hint">
           {mb} MB · rendered in {(phase.ms / 1000).toFixed(1)} s · no watermark
         </p>
-        {isNative && <p className="hint">Also saved in Files › On My iPhone › Xmotion › Exports.</p>}
+        {isNative && !isAndroid && <p className="hint">Also saved in Files › On My iPhone › Xmotion › Exports.</p>}
+        {isAndroid && <p className="hint">Tap Share to save it to your gallery or send it to TikTok, Instagram and more.</p>}
         {!isNative && canShareFiles() && <p className="hint">Tap Share, then Save Video (or Save Image / Save to Files).</p>}
         <div className="row-btns">
           <button type="button" className="btn primary" onClick={() => void saveFile(phase.blob, phase.filename)}>

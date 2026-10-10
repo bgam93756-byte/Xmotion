@@ -10,6 +10,17 @@ const config: CapacitorConfig = {
     // Keep the editor from rubber-banding while dragging on the canvas and timeline.
     scrollEnabled: false,
   },
+  android: {
+    backgroundColor: '#0b0c10',
+  },
+  plugins: {
+    SystemBars: {
+      // Light status bar icons over the dark app; the page handles the insets (viewport-fit=cover).
+      style: 'DARK',
+      insetsHandling: 'native',
+      initialViewportFitValueHint: 'cover',
+    },
+  },
 };
 
 export default config;

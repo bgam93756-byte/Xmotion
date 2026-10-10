@@ -1,13 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import type { BlendMode, EaseName, Keyframe, Layer, MaskMode, Project, PropValue, ShapeKind, TextAnimator, TextAnimUnit, Vec2 } from '../model/types';
 import { evalPropAt, keyAt, vec } from '../model/animate';
 import { EASE_LABELS, applyEase, bezierFor } from '../model/easing';
 import { EFFECT_DEFS, EFFECT_LIST } from '../model/effectDefs';
-import { CATEGORIES as EFFECT_CATEGORIES } from '../effects';
 import { validateExpr } from '../model/expr';
 import { ANIM_PRESETS } from '../model/presets';
-import { PROJECT_PRESETS, getProp, propSections, type PropDef } from '../model/schema';
+import { PROJECT_PRESETS, createEffect, findDef, getProp, propSections, type PropDef } from '../model/schema';
 import { allLayers, ancestors, findLayer } from '../model/tree';
 import { FONT_LIST, ensureFont } from '../engine/fonts';
 import { media } from '../engine/media';
@@ -23,6 +21,7 @@ import {
   duplicateLayer,
   duplicateLayers,
   groupLayers,
+  keyedAtPlayhead,
   layerById,
   moveLayer,
   openSheet,
@@ -40,6 +39,7 @@ import {
   splitLayer,
   toggleAnimated,
   toggleKeyAtPlayhead,
+  toggleKeysAtPlayhead,
   ungroup,
   update,
   useEditor,
@@ -47,8 +47,9 @@ import {
 import { saveAsElement } from '../state/elements';
 import { BezierEditor, easePreview } from './controls/BezierEditor';
 import { ColorField, IconButton, NumberField, Section, Select, Slider, Toggle } from './controls/fields';
-import { Icon } from './icons';
+import { Icon, type IconName } from './icons';
 import { PropMenu, type MenuItem } from './PropMenu';
+import { EffectBrowser } from './EffectBrowser';
 import './inspector.css';
 
 const BLEND_MODES: { value: BlendMode; label: string }[] = [
@@ -225,9 +226,156 @@ function ProjectPanel({ project }: { project: Project }) {
 
 /* ---------------- layer ---------------- */
 
+/**
+ * A layer's property categories, named like Alight Motion's: phones show one
+ * at a time in the panel under the timeline, wide screens stack them all.
+ */
+export type CatId = 'keyframe' | 'camera' | 'type' | 'transform' | 'effects' | 'fill' | 'border' | 'blend' | 'animate' | 'timing';
+
+export interface Category {
+  id: CatId;
+  label: string;
+  icon: IconName;
+}
+
+const TYPE_CATEGORY: Partial<Record<Layer['type'], { label: string; icon: IconName }>> = {
+  shape: { label: 'Shape', icon: 'shapes' },
+  text: { label: 'Edit text', icon: 'text' },
+  image: { label: 'Media', icon: 'image' },
+  video: { label: 'Media', icon: 'video' },
+  audio: { label: 'Audio', icon: 'music' },
+  group: { label: 'Group', icon: 'group' },
+};
+
+/** Categories of a layer; `withKey` adds the selected keyframe's easing first. */
+export function layerCategories(layer: Layer, withKey = false): Category[] {
+  const t = layer.type;
+  const drawn = t !== 'audio' && t !== 'camera';
+  const out: Category[] = [];
+  if (withKey) out.push({ id: 'keyframe', label: 'Keyframe', icon: 'keyframe' });
+  if (t === 'camera') out.push({ id: 'camera', label: 'Camera', icon: 'camera' });
+  const tc = TYPE_CATEGORY[t];
+  if (tc) out.push({ id: 'type', ...tc });
+  if (drawn && t !== 'adjustment') out.push({ id: 'transform', label: 'Move & Transform', icon: 'move' });
+  if (drawn) out.push({ id: 'effects', label: 'Effects', icon: 'fx' });
+  if (t === 'shape' || t === 'text') out.push({ id: 'fill', label: 'Color & Fill', icon: 'palette' });
+  if (drawn && t !== 'null' && t !== 'adjustment') out.push({ id: 'border', label: 'Border & Shadow', icon: 'border' });
+  if (drawn && t !== 'null') out.push({ id: 'blend', label: 'Blending & Opacity', icon: 'blend' });
+  if (drawn && t !== 'adjustment') out.push({ id: 'animate', label: 'Animate', icon: 'wand' });
+  out.push({ id: 'timing', label: 'Timing', icon: 'clock' });
+  return out;
+}
+
+/** Properties a category's ◆ button keyframes together. */
+export function categoryKeys(layer: Layer, id: CatId): string[] {
+  switch (id) {
+    case 'transform':
+      return layer.threeD ? ['position', 'z', 'scale', 'rotation', 'rotX', 'rotY'] : ['position', 'scale', 'rotation'];
+    case 'camera':
+      return sectionDefs(layer, 'Camera').map((d) => d.key);
+    case 'fill':
+      return (layer.fillType ?? 'solid') === 'solid' ? ['fill'] : ['fill', 'fill2', 'gradAngle'];
+    case 'border':
+      return layer.type === 'shape' || layer.type === 'text' ? ['strokeColor', 'strokeWidth'] : [];
+    case 'blend':
+      return ['opacity'];
+    default:
+      return [];
+  }
+}
+
+/** The property definitions of one of the layer's schema sections. */
+function sectionDefs(layer: Layer, title: string): PropDef[] {
+  return propSections(layer).find((s) => s.title === title)?.defs ?? [];
+}
+
+function PropRows({ project, layer, defs }: { project: Project; layer: Layer; defs: PropDef[] }) {
+  return (
+    <>
+      {defs.map((d) => (
+        <PropRow key={d.key} project={project} layer={layer} path={d.key} def={d} />
+      ))}
+    </>
+  );
+}
+
+/** ◆ of a category: keyframes all its main properties at the playhead (or removes those keys). */
+export function CategoryKeyButton({ project, layer, id }: { project: Project; layer: Layer; id: CatId }) {
+  const time = useEditor((s) => s.time);
+  const keys = categoryKeys(layer, id);
+  if (!keys.length) return null;
+  const on = keyedAtPlayhead(project, layer, keys, time);
+  const animated = keys.some((k) => !!getProp(layer, k).keys?.length);
+  return (
+    <button
+      type="button"
+      className={`kf-btn ${animated ? 'animated' : ''} ${on ? 'on' : ''}`}
+      title={on ? 'Remove these keyframes at the playhead' : 'Keyframe all of these at the playhead'}
+      aria-label={on ? 'Remove keyframes here' : 'Add keyframes here'}
+      onClick={(e) => {
+        e.stopPropagation();
+        toggleKeysAtPlayhead(layer.id, keys);
+      }}
+    >
+      <Icon name={on ? 'keyframe' : 'diamond'} size={14} />
+    </button>
+  );
+}
+
+export function CategoryBody({ project, layer, id }: { project: Project; layer: Layer; id: CatId }) {
+  switch (id) {
+    case 'keyframe':
+      return <KeyframeBody project={project} layer={layer} />;
+    case 'camera':
+      return (
+        <>
+          <CameraInfo project={project} layer={layer} />
+          <PropRows project={project} layer={layer} defs={sectionDefs(layer, 'Camera')} />
+        </>
+      );
+    case 'type':
+      return <TypeBody project={project} layer={layer} />;
+    case 'transform':
+      return <TransformBody project={project} layer={layer} />;
+    case 'effects':
+      return <EffectsBody project={project} layer={layer} />;
+    case 'fill':
+      return <FillBody project={project} layer={layer} />;
+    case 'border':
+      return <BorderBody project={project} layer={layer} />;
+    case 'blend':
+      return <BlendBody project={project} layer={layer} />;
+    case 'animate':
+      return <AnimateBody layer={layer} />;
+    case 'timing':
+      return <TimingBody project={project} layer={layer} />;
+  }
+}
+
+/** Phones: the open category of the selected layer, under the timeline. */
+export function CategoryPanel({ project, layer }: { project: Project; layer: Layer }) {
+  const tab = useEditor((s) => s.propTab);
+  const keySel = useEditor((s) => s.keySel);
+  const cats = layerCategories(layer, keySel?.layerId === layer.id);
+  const cat = cats.find((c) => c.id === tab) ?? cats.find((c) => c.id !== 'keyframe') ?? cats[0];
+  return (
+    <div className="cat-panel">
+      <div className="cat-head">
+        <Icon name={cat.icon} size={18} />
+        <span className="cat-title ellipsis">{cat.label}</span>
+        <CategoryKeyButton project={project} layer={layer} id={cat.id} />
+        <IconButton icon="down" title="Close panel" onClick={() => openSheet(null)} />
+      </div>
+      <div className="cat-body" key={`${layer.id}:${cat.id}`}>
+        <CategoryBody project={project} layer={layer} id={cat.id} />
+      </div>
+    </div>
+  );
+}
+
+/** Wide screens: every category of the layer, stacked. */
 function LayerPanel({ project, layer }: { project: Project; layer: Layer }) {
   const keySel = useEditor((s) => s.keySel);
-  const sections = propSections(layer);
   // Stacking order within the layer's own container (root or group).
   const found = findLayer(project, layer.id);
   const idx = found?.index ?? 0;
@@ -242,6 +390,7 @@ function LayerPanel({ project, layer }: { project: Project; layer: Layer }) {
         <IconButton icon="scissors" title="Split at playhead (S)" onClick={() => splitLayer(layer.id)} />
         <IconButton icon="copy" title="Duplicate (Ctrl+D)" onClick={() => duplicateLayer(layer.id)} />
         <IconButton icon="trash" title="Delete (Del)" onClick={() => deleteLayer(layer.id)} />
+        <IconButton icon="more" title="More: copy, paste, group, save as element…" onClick={() => openSheet('more')} />
         <IconButton icon="close" title="Close" onClick={closePanel} />
       </div>
       {found?.group && (
@@ -250,101 +399,193 @@ function LayerPanel({ project, layer }: { project: Project; layer: Layer }) {
           <span className="ellipsis">In {pathLabel(project, found.group)}</span>
         </button>
       )}
-      {keySel?.layerId === layer.id && <KeyframeSection project={project} layer={layer} />}
-      <TypeSettings project={project} layer={layer} />
-      {sections.map((s) => (
-        <Section key={s.title} title={s.title} id={`${layer.type}.${s.title}`}>
-          {s.defs.map((d) => (
-            <PropRow key={d.key} project={project} layer={layer} path={d.key} def={d} />
-          ))}
-          {s.title === 'Transform' && <AnchorTools project={project} layer={layer} />}
-          {s.title === 'Time remapping' && <p className="hint">Keyframe the layer's own time (seconds) to freeze, slow down, speed up or reverse it.</p>}
+      {keySel?.layerId === layer.id && (
+        <Section title="Keyframe" id="keyframe">
+          <KeyframeBody project={project} layer={layer} />
+        </Section>
+      )}
+      {layerCategories(layer).map((c) => (
+        <Section
+          key={c.id}
+          title={c.id === 'effects' && layer.effects.length ? `Effects (${layer.effects.length})` : c.label}
+          id={`${layer.type}.${c.id}`}
+          right={<CategoryKeyButton project={project} layer={layer} id={c.id} />}
+        >
+          <CategoryBody project={project} layer={layer} id={c.id} />
         </Section>
       ))}
-      {layer.type !== 'audio' && layer.type !== 'camera' && <EffectsSection project={project} layer={layer} />}
-      {layer.type !== 'audio' && layer.type !== 'adjustment' && layer.type !== 'camera' && <PresetsSection layer={layer} />}
-      <TimingSection project={project} layer={layer} />
     </>
   );
 }
 
-function TimingSection({ project, layer }: { project: Project; layer: Layer }) {
+function TransformBody({ project, layer }: { project: Project; layer: Layer }) {
+  // Opacity lives in Blending & Opacity.
+  const defs = sectionDefs(layer, 'Transform').filter((d) => d.key !== 'opacity');
+  return (
+    <>
+      {layer.type === 'null' && <p className="hint">Nulls are invisible. Parent layers to this null (Timing › Parent) to move, scale and rotate them together.</p>}
+      <PropRows project={project} layer={layer} defs={defs} />
+      <AnchorTools project={project} layer={layer} />
+      {CAN_3D.has(layer.type) && (
+        <div className="row">
+          <span className="row-label" title="Adds Z position and X/Y rotation; seen through the camera">
+            3D layer
+          </span>
+          <Toggle on={!!layer.threeD} onChange={(v) => patchLayer(layer.id, { threeD: v })} />
+          {layer.threeD && <span className="row-value muted">Z and X/Y rotation above</span>}
+        </div>
+      )}
+    </>
+  );
+}
+
+function FillBody({ project, layer }: { project: Project; layer: Layer }) {
+  const gradient = (layer.fillType ?? 'solid') !== 'solid';
+  const defs = sectionDefs(layer, 'Fill').filter((d) => gradient || d.key === 'fill');
+  return (
+    <>
+      <div className="row">
+        <span className="row-label">Fill</span>
+        <Toggle on={!!layer.fillOn} onChange={(v) => patchLayer(layer.id, { fillOn: v })} />
+        <Select
+          value={layer.fillType ?? 'solid'}
+          options={[
+            { value: 'solid', label: 'Solid color' },
+            { value: 'linear', label: 'Linear gradient' },
+            { value: 'radial', label: 'Radial gradient' },
+          ]}
+          onChange={(v) => patchLayer(layer.id, { fillType: v })}
+        />
+      </div>
+      <PropRows project={project} layer={layer} defs={defs} />
+      {!layer.fillOn && <p className="hint">Fill is off, so only the border is drawn.</p>}
+    </>
+  );
+}
+
+/** An effect switched on and off from a panel (border and shadow of any layer), with its settings. */
+function FxToggle({ project, layer, type, label }: { project: Project; layer: Layer; type: string; label: string }) {
+  const fx = layer.effects.find((e) => e.type === type);
+  const def = EFFECT_DEFS[type];
+  const on = !!fx?.enabled;
+  if (!def) return null;
+  const toggle = (v: boolean) =>
+    update((p) => {
+      const l = layerById(p, layer.id);
+      if (!l) return;
+      const cur = l.effects.find((e) => e.type === type);
+      // Off keeps the effect (disabled) so its settings come back.
+      if (cur) cur.enabled = v;
+      else if (v) l.effects.push(createEffect(type));
+    });
+  return (
+    <>
+      <div className="row">
+        <span className="row-label">{label}</span>
+        <Toggle on={on} onChange={toggle} />
+        {on && <span className="row-value muted">{def.label} effect</span>}
+      </div>
+      {on && fx && def.props.map((d) => <PropRow key={d.key} project={project} layer={layer} path={`fx.${fx.id}.${d.key}`} def={d} />)}
+    </>
+  );
+}
+
+function BorderBody({ project, layer }: { project: Project; layer: Layer }) {
+  const native = layer.type === 'shape' || layer.type === 'text';
+  return (
+    <>
+      {native ? (
+        <>
+          <div className="row">
+            <span className="row-label">Border</span>
+            <Toggle on={!!layer.strokeOn} onChange={(v) => patchLayer(layer.id, { strokeOn: v })} />
+          </div>
+          <PropRows project={project} layer={layer} defs={sectionDefs(layer, 'Stroke')} />
+        </>
+      ) : (
+        <FxToggle project={project} layer={layer} type="outline" label="Border" />
+      )}
+      <div className="sub-sep" />
+      <FxToggle project={project} layer={layer} type="shadow" label="Shadow" />
+    </>
+  );
+}
+
+function BlendBody({ project, layer }: { project: Project; layer: Layer }) {
+  const opacity = findDef(layer, 'opacity');
+  const mask = layer.maskMode ?? 'none';
+  return (
+    <>
+      {layer.type === 'adjustment' && <p className="hint">Lower the opacity to blend the adjustment’s effects with the layers below.</p>}
+      {opacity && <PropRow project={project} layer={layer} path="opacity" def={opacity} />}
+      <div className="row">
+        <span className="row-label">Blending</span>
+        <Select value={layer.blend} options={BLEND_MODES} onChange={(v) => patchLayer(layer.id, { blend: v })} />
+      </div>
+      {CAN_MASK.has(layer.type) && (
+        <>
+          <div className="row">
+            <span className="row-label">Mask</span>
+            {/* 'none' is stored as no mask at all. */}
+            <Select<MaskMode> value={mask} options={MASK_MODES} onChange={(v) => patchLayer(layer.id, { maskMode: v === 'none' ? undefined : v })} />
+          </div>
+          <p className="hint opt-hint">Hides everything below it in the same group{mask !== 'none' ? '. The mask itself isn’t drawn; its opacity sets the strength.' : '.'}</p>
+        </>
+      )}
+      <div className="row">
+        <span className="row-label" title="Only visible where the layer below is opaque">
+          Clip to below
+        </span>
+        <Toggle on={layer.clip} onChange={(v) => patchLayer(layer.id, { clip: v })} />
+      </div>
+    </>
+  );
+}
+
+function TimingBody({ project, layer }: { project: Project; layer: Layer }) {
   // A parent must be a sibling (same container).
   const siblings = (findLayer(project, layer.id)?.list ?? []).filter((l) => l.id !== layer.id && l.type !== 'audio');
-  const mask = layer.maskMode ?? 'none';
-  // Cameras draw nothing: no blending or clipping.
-  const drawn = layer.type !== 'camera';
   return (
-    <Section title="Timing & compositing" id="timing">
+    <>
       <div className="row">
         <span className="row-label">In / Out</span>
         <NumberField value={layer.start} min={0} max={layer.end - 1 / project.fps} step={1 / project.fps} unit="s" onChange={(v) => patchLayer(layer.id, { start: v }, `start:${layer.id}`)} />
         <NumberField value={layer.end} min={layer.start + 1 / project.fps} step={1 / project.fps} unit="s" onChange={(v) => patchLayer(layer.id, { end: v }, `end:${layer.id}`)} />
       </div>
-      {layer.type !== 'audio' && (
+      {CAN_REMAP.has(layer.type) && (
+        <div className="row">
+          <span className="row-label" title="Keyframe the layer's own time">
+            Time remap
+          </span>
+          <Toggle on={!!layer.timeRemapOn} onChange={(v) => setTimeRemap(layer.id, v)} />
+        </div>
+      )}
+      {layer.timeRemapOn && (
         <>
-          {drawn && (
-            <div className="row">
-              <span className="row-label">Blend</span>
-              <Select value={layer.blend} options={BLEND_MODES} onChange={(v) => patchLayer(layer.id, { blend: v })} />
-            </div>
-          )}
-          {CAN_MASK.has(layer.type) && (
-            <>
-              <div className="row">
-                <span className="row-label">Mask</span>
-                {/* 'none' is stored as no mask at all. */}
-                <Select<MaskMode> value={mask} options={MASK_MODES} onChange={(v) => patchLayer(layer.id, { maskMode: v === 'none' ? undefined : v })} />
-              </div>
-              <p className="hint opt-hint">Hides everything below it in the same group{mask !== 'none' ? '. The mask itself isn’t drawn; its opacity sets the strength.' : '.'}</p>
-            </>
-          )}
-          {drawn && (
-            <div className="row">
-              <span className="row-label" title="Only visible where the layer below is opaque">
-                Clip to below
-              </span>
-              <Toggle on={layer.clip} onChange={(v) => patchLayer(layer.id, { clip: v })} />
-            </div>
-          )}
-          {CAN_3D.has(layer.type) && (
-            <div className="row">
-              <span className="row-label" title="Adds Z position and X/Y rotation; seen through the camera">
-                3D layer
-              </span>
-              <Toggle on={!!layer.threeD} onChange={(v) => patchLayer(layer.id, { threeD: v })} />
-              {layer.threeD && <span className="row-value muted">Z, X/Y rotation in Transform</span>}
-            </div>
-          )}
-          {CAN_REMAP.has(layer.type) && (
-            <div className="row">
-              <span className="row-label" title="Keyframe the layer's own time">
-                Time remap
-              </span>
-              <Toggle on={!!layer.timeRemapOn} onChange={(v) => setTimeRemap(layer.id, v)} />
-              {layer.timeRemapOn && <span className="row-value muted">Keyframe it in Time remapping</span>}
-            </div>
-          )}
-          <div className="row">
-            <span className="row-label">Parent</span>
-            <Select
-              value={layer.parent ?? ''}
-              options={[{ value: '', label: 'None' }, ...siblings.map((l) => ({ value: l.id, label: l.name }))]}
-              onChange={(v) => setParent(layer.id, v || null)}
-            />
-          </div>
+          <PropRows project={project} layer={layer} defs={sectionDefs(layer, 'Time remapping')} />
+          <p className="hint">Keyframe the layer's own time (seconds) to freeze, slow down, speed up or reverse it.</p>
         </>
       )}
-    </Section>
+      {layer.type !== 'audio' && (
+        <div className="row">
+          <span className="row-label">Parent</span>
+          <Select
+            value={layer.parent ?? ''}
+            options={[{ value: '', label: 'None' }, ...siblings.map((l) => ({ value: l.id, label: l.name }))]}
+            onChange={(v) => setParent(layer.id, v || null)}
+          />
+        </div>
+      )}
+    </>
   );
 }
 
-function TypeSettings({ project, layer }: { project: Project; layer: Layer }) {
+function TypeBody({ project, layer }: { project: Project; layer: Layer }) {
   const id = layer.id;
   switch (layer.type) {
     case 'shape':
       return (
-        <Section title="Shape" id="shape-settings">
+        <>
           {layer.shape !== 'path' ? (
             <div className="seg">
               {(['rect', 'ellipse', 'polygon', 'star'] as ShapeKind[]).map((k) => (
@@ -359,32 +600,17 @@ function TypeSettings({ project, layer }: { project: Project; layer: Layer }) {
               <Toggle on={!!layer.closed} onChange={(v) => patchLayer(id, { closed: v })} />
             </div>
           )}
-          <div className="row">
-            <span className="row-label">Fill</span>
-            <Toggle on={!!layer.fillOn} onChange={(v) => patchLayer(id, { fillOn: v })} />
-            <Select
-              value={layer.fillType ?? 'solid'}
-              options={[
-                { value: 'solid', label: 'Solid' },
-                { value: 'linear', label: 'Linear gradient' },
-                { value: 'radial', label: 'Radial gradient' },
-              ]}
-              onChange={(v) => patchLayer(id, { fillType: v })}
-            />
-          </div>
-          <div className="row">
-            <span className="row-label">Stroke</span>
-            <Toggle on={!!layer.strokeOn} onChange={(v) => patchLayer(id, { strokeOn: v })} />
-          </div>
-        </Section>
+          <PropRows project={project} layer={layer} defs={sectionDefs(layer, 'Shape')} />
+        </>
       );
     case 'text': {
       const fonts = [...FONT_LIST.map((f) => f.family), ...project.assets.filter((a) => a.kind === 'font' && a.fontFamily).map((a) => a.fontFamily!)];
       return (
-        <Section title="Text content" id="text-settings">
+        <>
           <textarea
             className="text-area"
             value={layer.text}
+            aria-label="Text"
             rows={Math.min(6, Math.max(2, (layer.text ?? '').split('\n').length))}
             onChange={(e) => patchLayer(id, { text: e.target.value }, `text:${id}`)}
             onKeyDown={(e) => e.stopPropagation()}
@@ -427,20 +653,7 @@ function TypeSettings({ project, layer }: { project: Project; layer: Layer }) {
               ))}
             </div>
           </div>
-          <div className="row">
-            <span className="row-label">Fill / Stroke</span>
-            <Toggle on={!!layer.fillOn} onChange={(v) => patchLayer(id, { fillOn: v })} />
-            <Select
-              value={layer.fillType ?? 'solid'}
-              options={[
-                { value: 'solid', label: 'Solid' },
-                { value: 'linear', label: 'Gradient' },
-                { value: 'radial', label: 'Radial' },
-              ]}
-              onChange={(v) => patchLayer(id, { fillType: v })}
-            />
-            <Toggle on={!!layer.strokeOn} onChange={(v) => patchLayer(id, { strokeOn: v })} />
-          </div>
+          <PropRows project={project} layer={layer} defs={sectionDefs(layer, 'Text')} />
           <div className="row">
             <span className="row-label">Animator</span>
             <Select<TextAnimator>
@@ -467,8 +680,9 @@ function TypeSettings({ project, layer }: { project: Project; layer: Layer }) {
               onChange={(v) => patchLayer(id, { animUnit: v })}
             />
           </div>
-          <p className="hint">Keyframe “Reveal” below (or use a Text preset) to drive the animator.</p>
-        </Section>
+          <PropRows project={project} layer={layer} defs={sectionDefs(layer, 'Text animation')} />
+          <p className="hint">Keyframe “Reveal” (or use a Text preset in Animate) to drive the animator.</p>
+        </>
       );
     }
     case 'image':
@@ -486,7 +700,7 @@ function TypeSettings({ project, layer }: { project: Project; layer: Layer }) {
         });
       };
       return (
-        <Section title="Media" id="media-settings">
+        <>
           <div className="row">
             <span className="row-label">Source</span>
             <span className="row-value ellipsis">{a?.meta.name ?? 'Missing media'}</span>
@@ -538,17 +752,13 @@ function TypeSettings({ project, layer }: { project: Project; layer: Layer }) {
               </div>
             </>
           )}
-        </Section>
+        </>
       );
     }
-    case 'adjustment':
-      return <p className="hint pad">Effects on an adjustment layer apply to every layer below it. Lower its opacity to blend the result.</p>;
-    case 'null':
-      return <p className="hint pad">Nulls are invisible. Parent layers to this null to move, scale and rotate them together.</p>;
     case 'group': {
       const kids = layer.children ?? [];
       return (
-        <Section title="Group" id="group-settings">
+        <>
           <div className="row">
             <span className="row-label">Contents</span>
             <span className="row-value">{kids.length === 1 ? '1 layer' : `${kids.length} layers`}</span>
@@ -567,11 +777,11 @@ function TypeSettings({ project, layer }: { project: Project; layer: Layer }) {
             </div>
           )}
           <p className="hint">Double-tap a layer of the group on the canvas to edit that layer.</p>
-        </Section>
+        </>
       );
     }
-    case 'camera':
-      return <CameraInfo project={project} layer={layer} />;
+    default:
+      return null;
   }
 }
 
@@ -585,7 +795,7 @@ function CameraInfo({ project, layer }: { project: Project; layer: Layer }) {
       <p className="hint">3D layers are seen through the top-most visible camera. 2D layers stay flat on the screen.</p>
       {active && inUse && inUse.id !== layer.id && <p className="hint">“{inUse.name}” is above this camera, so it is the one in use at the playhead.</p>}
       {!active && <p className="hint">This camera isn’t active at the playhead (hidden, outside its In/Out, or in a hidden group).</p>}
-      {!has3D && <p className="hint cam-note">No 3D layers yet. Turn on “3D layer” in a layer’s Timing &amp; compositing section.</p>}
+      {!has3D && <p className="hint cam-note">No 3D layers yet. Turn on “3D layer” in a layer’s Move &amp; Transform panel.</p>}
     </div>
   );
 }
@@ -833,8 +1043,8 @@ function ExprInput({ value, onChange }: { value: string; onChange: (expr: string
 
 /* ---------------- effects ---------------- */
 
-function EffectsSection({ project, layer }: { project: Project; layer: Layer }) {
-  const [picking, setPicking] = useState(false);
+function EffectsBody({ project, layer }: { project: Project; layer: Layer }) {
+  const [browsing, setBrowsing] = useState(false);
   const fxClip = useEditor((s) => s.fxClipboard);
   const needsRefs = layer.effects.some((e) => EFFECT_DEFS[e.type]?.refs?.length);
   // Effect references may point anywhere in the tree; nested layers show their group path.
@@ -847,14 +1057,13 @@ function EffectsSection({ project, layer }: { project: Project; layer: Layer }) 
         : [],
     [needsRefs, project, layer.id],
   );
-  const adder = (
-    <button type="button" className="btn small add-fx" onClick={() => setPicking(true)}>
-      <Icon name="plus" size={14} /> Add effect
-    </button>
-  );
   return (
-    <Section title={`Effects${layer.effects.length ? ` (${layer.effects.length})` : ''}`} id="effects" right={adder}>
-      {!layer.effects.length && <p className="hint">{EFFECT_LIST.length} effects: glow, blur, chroma key, 3D shapes, glitch, repeaters, generators… Stack as many as you like.</p>}
+    <>
+      {layer.type === 'adjustment' && <p className="hint">Effects on an adjustment layer apply to every layer below it.</p>}
+      <button type="button" className="btn add-fx-big" onClick={() => setBrowsing(true)}>
+        <Icon name="plus" size={16} /> Add effect
+      </button>
+      {!layer.effects.length && <p className="hint">{EFFECT_LIST.length} effects: shake, glow, blur, chroma key, 3D, glitch, repeaters, generators… Stack as many as you like.</p>}
       {layer.effects.map((e, i) => {
         const def = EFFECT_DEFS[e.type];
         if (!def) return null;
@@ -911,102 +1120,21 @@ function EffectsSection({ project, layer }: { project: Project; layer: Layer }) 
           </button>
         </div>
       )}
-      {picking && (
-        <EffectPicker
+      {browsing && (
+        <EffectBrowser
           layer={layer}
           onPick={(type) => {
             addEffect(layer.id, type);
-            setPicking(false);
+            setBrowsing(false);
           }}
-          onClose={() => setPicking(false)}
+          onClose={() => setBrowsing(false)}
         />
       )}
-    </Section>
+    </>
   );
 }
 
-const RECENT_KEY = 'xm.recentFx';
-function recentFx(): string[] {
-  try {
-    return JSON.parse(localStorage.getItem(RECENT_KEY) ?? '[]');
-  } catch {
-    return [];
-  }
-}
-
-/** Full-screen searchable list of every effect, grouped by category. */
-function EffectPicker({ layer, onPick, onClose }: { layer: Layer; onPick: (type: string) => void; onClose: () => void }) {
-  const [q, setQ] = useState('');
-  const [cat, setCat] = useState<string>('All');
-  const query = q.trim().toLowerCase();
-  const fits = (d: (typeof EFFECT_LIST)[number]) => (d.category !== 'Text' || layer.type === 'text' || d.type === 'countUpDown' || d.type === 'timecode') && (d.category !== 'Shape' || layer.type === 'shape' || layer.type === 'text');
-  const list = EFFECT_LIST.filter((d) => fits(d) && (cat === 'All' || d.category === cat) && (!query || d.label.toLowerCase().includes(query) || d.description.toLowerCase().includes(query) || d.category.toLowerCase().includes(query)));
-  const recent = recentFx()
-    .map((t) => EFFECT_DEFS[t])
-    .filter((d) => d && fits(d));
-  const pick = (type: string) => {
-    try {
-      localStorage.setItem(RECENT_KEY, JSON.stringify([type, ...recentFx().filter((t) => t !== type)].slice(0, 8)));
-    } catch {
-      /* storage unavailable */
-    }
-    onPick(type);
-  };
-  const groups = cat === 'All' && !query ? EFFECT_CATEGORIES.filter((c) => list.some((d) => d.category === c)) : [null];
-  // Portal: the docked properties sheet is transformed, which would trap a fixed overlay.
-  return createPortal(
-    <div className="sheet-layer modal fx-picker" onPointerDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="sheet" role="dialog" aria-label="Add effect">
-        <div className="sheet-head">
-          <span className="sheet-grip" />
-          <span className="sheet-title">Add effect · {EFFECT_LIST.length}</span>
-          <IconButton icon="close" title="Close" onClick={onClose} />
-        </div>
-        <div className="fx-search">
-          <input autoFocus className="text-input" placeholder="Search effects (glow, 3D, glitch, key…)" value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.stopPropagation()} />
-          <div className="chips scroll">
-            {['All', ...EFFECT_CATEGORIES].map((c) => (
-              <button key={c} type="button" className={`chip ${cat === c ? 'on' : ''}`} onClick={() => setCat(c)}>
-                {c}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="sheet-body fx-list">
-          {!query && cat === 'All' && recent.length > 0 && (
-            <>
-              <h4>Recent</h4>
-              <div className="chips">
-                {recent.map((d) => (
-                  <button key={d.type} type="button" className="chip" onClick={() => pick(d.type)}>
-                    {d.label}
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-          {groups.map((g) => (
-            <div key={g ?? 'results'}>
-              {g && <h4>{g}</h4>}
-              {list
-                .filter((d) => !g || d.category === g)
-                .map((d) => (
-                  <button key={d.type} type="button" className="fx-item" onClick={() => pick(d.type)}>
-                    <b>{d.label}</b>
-                    <span>{d.description}</span>
-                  </button>
-                ))}
-            </div>
-          ))}
-          {!list.length && <p className="hint">No effects match “{q}”.</p>}
-        </div>
-      </div>
-    </div>,
-    document.body,
-  );
-}
-
-function PresetsSection({ layer }: { layer: Layer }) {
+function AnimateBody({ layer }: { layer: Layer }) {
   const groups = ['In', 'Out', 'Loop', 'Text'] as const;
   const apply = (id: string) =>
     update((p) => {
@@ -1015,7 +1143,7 @@ function PresetsSection({ layer }: { layer: Layer }) {
       if (l && preset) preset.apply(l, p);
     });
   return (
-    <Section title="Animate" id="presets">
+    <>
       {groups.map((g) => {
         const list = ANIM_PRESETS.filter((p) => p.group === g && (!p.textOnly || layer.type === 'text'));
         if (!list.length) return null;
@@ -1032,13 +1160,13 @@ function PresetsSection({ layer }: { layer: Layer }) {
           </div>
         );
       })}
-    </Section>
+    </>
   );
 }
 
 /* ---------------- keyframe easing ---------------- */
 
-function KeyframeSection({ project, layer }: { project: Project; layer: Layer }) {
+function KeyframeBody({ project, layer }: { project: Project; layer: Layer }) {
   const keySel = useEditor((s) => s.keySel)!;
   const prop = getProp(layer, keySel.path);
   const key = prop.keys?.find((k) => k.id === keySel.keyId);
@@ -1047,9 +1175,9 @@ function KeyframeSection({ project, layer }: { project: Project; layer: Layer })
   const fps = project.fps;
   const bez = bezierFor(key.ease, key.bez);
   const nonBezier = ['backIn', 'backOut', 'elastic', 'bounce', 'hold'].includes(key.ease);
-  const label = keySel.path.startsWith('fx.') ? keySel.path.split('.').pop() : keySel.path;
+  const label = findDef(layer, keySel.path)?.label ?? keySel.path.split('.').pop();
   return (
-    <Section title="Keyframe" id="keyframe">
+    <>
       <div className="row">
         <span className="row-label">Property</span>
         <span className="row-value">{label}</span>
@@ -1079,7 +1207,7 @@ function KeyframeSection({ project, layer }: { project: Project; layer: Layer })
       <button type="button" className="btn ghost danger" onClick={() => deleteKey(keySel)}>
         <Icon name="trash" size={14} /> Delete keyframe
       </button>
-    </Section>
+    </>
   );
 }
 

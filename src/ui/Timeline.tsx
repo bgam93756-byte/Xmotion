@@ -489,7 +489,7 @@ export function Timeline() {
           })}
           {!rows.length && (
             <div className="tl-empty" style={{ left: NW + 12 }}>
-              Tap <b>+ Add</b> to add text, shapes, photos, video or music.
+              Tap <b>+</b> to add text, shapes, photos, video or music.
             </div>
           )}
           <div className="tl-row tl-spacer" />

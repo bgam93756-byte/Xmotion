@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { useBackHandler } from './back';
 import { setView, toast, update, useEditor, type ViewSettings } from '../state/store';
 import { Icon } from './icons';
 import './viewport.css';
@@ -36,6 +37,7 @@ export function ViewMenu() {
   const view = useEditor((s) => s.view);
   const guideCount = useEditor((s) => (s.project?.guides ? s.project.guides.v.length + s.project.guides.h.length : 0));
   const [open, setOpen] = useState(false);
+  useBackHandler(open, () => setOpen(false));
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {

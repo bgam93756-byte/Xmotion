@@ -69,6 +69,8 @@ export interface EditorState {
   toast: { msg: string; id: number } | null;
   /** Bottom sheet / dialog currently shown. */
   sheet: Sheet;
+  /** Property category shown in the phone properties panel (sheet 'props'). */
+  propTab: string;
   /** Pen tool brush */
   brush: { color: string; width: number };
   /** Property shown in the graph editor. */
@@ -144,12 +146,18 @@ export const useEditor = create<EditorState>(() => ({
   view: loadView(),
   toast: null,
   sheet: null,
+  propTab: 'transform',
   brush: { color: '#ffffff', width: 12 },
   graph: null,
 }));
 
 export function openSheet(sheet: Sheet) {
   useEditor.setState({ sheet });
+}
+
+/** Phones: opens the properties panel on a category (Move & Transform, Effects…). */
+export function openPanel(tab: string) {
+  useEditor.setState({ sheet: 'props', propTab: tab });
 }
 
 /** Shows a property's curves in the graph editor (null closes it). */
@@ -999,6 +1007,54 @@ export function toggleKeyAtPlayhead(layerId: string, path: string) {
       sortKeys(prop);
     }
   });
+}
+
+/** Whether every one of the properties has a keyframe at the playhead. */
+export function keyedAtPlayhead(project: Project, layer: Layer, paths: string[], time: number): boolean {
+  return (
+    paths.length > 0 &&
+    paths.every((path) => {
+      const prop = getProp(layer, path);
+      return !!prop.keys?.length && !!keyAt(prop, propClock(project, layer, path, time) - layer.start, project.fps);
+    })
+  );
+}
+
+/**
+ * Keyframes several properties at the playhead in one step (a panel's ◆ button),
+ * or removes their keyframes there when every one of them already has one.
+ */
+export function toggleKeysAtPlayhead(layerId: string, paths: string[]) {
+  const { time } = get();
+  update((p) => {
+    const l = layerById(p, layerId);
+    if (!l) return;
+    const ctx = ctxFor(p, l);
+    // Values are read before any key changes.
+    const items = paths.flatMap((path) => {
+      const o = propOwner(l, path);
+      if (!o) return [];
+      const clock = propClock(p, l, path, time);
+      return [{ o, local: clock - l.start, current: evalPropAt(l, path, clock, ctx) }];
+    });
+    const remove = keyedAtPlayhead(p, l, paths, time);
+    for (const { o, local, current } of items) {
+      const prop = o.owner[o.key] ?? (o.owner[o.key] = { value: cloneValue(current) });
+      const existing = prop.keys?.length ? keyAt(prop, local, p.fps) : undefined;
+      if (remove) {
+        if (!existing) continue;
+        prop.keys = prop.keys!.filter((k) => k !== existing);
+        if (!prop.keys.length) {
+          prop.value = cloneValue(existing.v);
+          delete prop.keys;
+        }
+      } else if (!existing) {
+        (prop.keys ??= []).push({ id: uid('k'), t: Math.round(local * p.fps) / p.fps, v: cloneValue(current), ease: DEFAULT_EASE });
+        sortKeys(prop);
+      }
+    }
+  });
+  set({ expanded: { ...get().expanded, [layerId]: true } });
 }
 
 function findKey(p: Project, s: KeySel) {

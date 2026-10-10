@@ -10,8 +10,11 @@ import {
   groupLayers,
   layerById,
   moveLayer,
+  openGraph,
+  openPanel,
   openSheet,
   pasteLayer,
+  patchLayer,
   redo,
   select,
   selectedIds,
@@ -25,17 +28,19 @@ import {
   useEditor,
   type Sheet as SheetKind,
 } from '../state/store';
+import type { Layer } from '../model/types';
 import { Viewport } from './Viewport';
-import { Timeline } from './Timeline';
+import { Timeline, layerIcon } from './Timeline';
 import { GraphEditor } from './GraphEditor';
-import { Inspector } from './Inspector';
+import { CategoryPanel, Inspector, layerCategories } from './Inspector';
 import { ExportSheet } from './ExportSheet';
 import { AddSheet } from './AddSheet';
 import { MoreSheet } from './MoreSheet';
 import { HelpSheet } from './HelpSheet';
-import { Icon } from './icons';
+import { Icon, type IconName } from './icons';
 import { IconButton } from './controls/fields';
-import { addText, deleteSelection, importFiles, selectAll } from './actions';
+import { deleteSelection, importFiles, selectAll } from './actions';
+import { useBackHandler } from './back';
 import './sheets.css';
 
 export function formatTime(t: number, fps: number) {
@@ -45,11 +50,15 @@ export function formatTime(t: number, fps: number) {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(f).padStart(2, '0')}`;
 }
 
+const WIDE_QUERY = '(min-width: 900px) and (min-height: 560px)';
+
+/** Wide screens (iPad, desktop) keep a side inspector; phones use the panels under the timeline. */
+export const isWideScreen = () => matchMedia(WIDE_QUERY).matches;
+
 function useWide() {
-  const q = '(min-width: 900px) and (min-height: 560px)';
-  const [wide, setWide] = useState(() => matchMedia(q).matches);
+  const [wide, setWide] = useState(() => matchMedia(WIDE_QUERY).matches);
   useEffect(() => {
-    const m = matchMedia(q);
+    const m = matchMedia(WIDE_QUERY);
     const fn = () => setWide(m.matches);
     m.addEventListener('change', fn);
     return () => m.removeEventListener('change', fn);
@@ -57,18 +66,33 @@ function useWide() {
   return wide;
 }
 
+/** Number of selected layers that exist (0, 1, or the multi-selection size). */
+function useSelectionCount() {
+  return useEditor((s) => {
+    if (s.selection.length > 1) return s.selection.length;
+    return s.project && layerById(s.project, s.selectedId) ? 1 : 0;
+  });
+}
+
 export function Editor() {
   const wide = useWide();
   const sheet = useEditor((s) => s.sheet);
+  const selCount = useSelectionCount();
   // The graph editor replaces the timeline while its layer exists.
   const graph = useEditor((s) => !!s.graph && !!s.project && !!findLayer(s.project, s.graph.layerId));
   useAutosave();
   useShortcuts();
+  useEditorBack();
+  useClosePanelOnDeselect();
   const [dropping, setDropping] = useState(false);
+  // Phones, like Alight Motion: a selected layer shows its actions and property
+  // categories under the timeline; a category opens its panel there.
+  const selecting = !wide && selCount > 0;
+  const editing = !wide && selCount === 1 && sheet === 'props';
 
   return (
     <div
-      className={`editor ${wide ? 'wide' : 'narrow'} ${graph ? 'has-graph' : ''} ${!wide && sheet === 'props' ? 'editing' : ''}`}
+      className={`editor ${wide ? 'wide' : 'narrow'} ${graph ? 'has-graph' : ''} ${selecting ? 'selecting' : ''} ${editing ? 'editing' : ''}`}
       onDragOver={(e) => {
         if (e.dataTransfer.types.includes('Files')) {
           e.preventDefault();
@@ -88,19 +112,26 @@ export function Editor() {
         <Viewport />
       </div>
       <Transport />
-      <div className={`ed-timeline ${graph ? 'graphing' : ''}`}>{graph ? <GraphEditor /> : <Timeline />}</div>
-      <BottomBar />
+      <div className={`ed-timeline ${graph ? 'graphing' : ''}`}>
+        {graph ? <GraphEditor /> : <Timeline />}
+        {!graph && (
+          <button type="button" className="fab" title="Add layer" aria-label="Add layer" onClick={() => openSheet('add')}>
+            <Icon name="plus" size={28} />
+          </button>
+        )}
+      </div>
       {wide && (
         <aside className="ed-inspector">
           <Inspector />
         </aside>
       )}
-      {/* Phones: properties sit under the timeline so both stay visible while editing. */}
-      {!wide && sheet === 'props' && (
+      {selecting && !editing && <SelectionBar />}
+      {editing && (
         <section className="ed-props" aria-label="Properties">
-          <Inspector />
+          <PhonePanel />
         </section>
       )}
+      {selecting && <CategoryBar />}
       {sheet === 'add' && (
         <Sheet kind="add" title="Add layer">
           <AddSheet />
@@ -148,6 +179,12 @@ function Sheet({ kind, title, children, modal = true, bare }: { kind: Exclude<Sh
   );
 }
 
+/** Project settings: a sheet on phones, the inspector (nothing selected) on wide screens. */
+function openProjectSettings() {
+  select(null);
+  openSheet(isWideScreen() ? null : 'project');
+}
+
 function TopBar() {
   const project = useEditor((s) => s.project)!;
   const canUndo = useEditor((s) => s.past.length > 0);
@@ -156,7 +193,7 @@ function TopBar() {
   return (
     <header className="topbar">
       <IconButton icon="back" title="Projects" onClick={() => void leaveEditor()} />
-      <button type="button" className="proj-name" onClick={() => (select(null), openSheet(matchMedia('(min-width: 900px)').matches ? null : 'project'))}>
+      <button type="button" className="proj-name" onClick={openProjectSettings}>
         <span className="ellipsis">{project.name}</span>
         <small>
           {project.width}×{project.height} · {project.fps}fps · {saveState === 'saved' ? 'Saved' : 'Saving…'}
@@ -165,7 +202,8 @@ function TopBar() {
       <div className="topbar-actions">
         <IconButton icon="undo" title="Undo (Ctrl+Z)" onClick={undo} disabled={!canUndo} />
         <IconButton icon="redo" title="Redo (Ctrl+Shift+Z)" onClick={redo} disabled={!canRedo} />
-        <IconButton icon="help" title="Help" onClick={() => openSheet('help')} className="hide-xs" />
+        <IconButton icon="settings" title="Project settings" onClick={openProjectSettings} />
+        <IconButton icon="help" title="Help" onClick={() => openSheet('help')} />
         <button type="button" className="btn primary export-btn" onClick={() => openSheet('export')}>
           <Icon name="share" size={16} />
           <span>Export</span>
@@ -200,41 +238,136 @@ function Transport() {
   );
 }
 
-function BottomBar() {
-  const selectedId = useEditor((s) => s.selectedId);
-  const multi = useEditor((s) => s.selection.length > 1);
-  const tool = useEditor((s) => s.tool);
-  const hasClip = useEditor((s) => !!s.clipboard?.layers.length);
-  const project = useEditor((s) => s.project)!;
-  const layer = layerById(project, selectedId);
-  const Btn = ({ icon, label, onClick, active, primary }: { icon: Parameters<typeof Icon>[0]['name']; label: string; onClick: () => void; active?: boolean; primary?: boolean }) => (
-    <button type="button" className={`bb-btn ${active ? 'active' : ''} ${primary ? 'primary' : ''}`} onClick={onClick}>
+function renameLayer(layer: Layer) {
+  const name = window.prompt('Layer name', layer.name);
+  if (name !== null && name.trim()) patchLayer(layer.id, { name: name.trim() });
+}
+
+function Act({ icon, label, onClick }: { icon: IconName; label: string; onClick: () => void }) {
+  return (
+    <button type="button" className="sel-btn" onClick={onClick}>
       <Icon name={icon} size={20} />
       <span>{label}</span>
     </button>
   );
+}
+
+/** Phones: actions for the selected layer(s), above the category bar. */
+function SelectionBar() {
+  const project = useEditor((s) => s.project)!;
+  const selectedId = useEditor((s) => s.selectedId);
+  const multi = useEditor((s) => s.selection.length > 1 && s.selection.length);
+  const layer = multi ? undefined : layerById(project, selectedId);
   return (
-    <nav className={`bottombar ${layer ? 'bb-selected' : ''}`}>
-      <Btn icon="plus" label="Add" primary onClick={() => openSheet('add')} />
+    <div className="sel-bar">
       {layer ? (
-        <>
-          <Btn icon="settings" label="Edit" onClick={() => openSheet('props')} />
-          {multi ? <Btn icon="group" label="Group" onClick={() => groupLayers()} /> : <Btn icon="scissors" label="Split" onClick={() => splitLayer(layer.id)} />}
-          <Btn icon="copy" label="Duplicate" onClick={() => duplicateLayers(selectedIds())} />
-          <Btn icon="trash" label="Delete" onClick={deleteSelection} />
-          <Btn icon="more" label="More" onClick={() => openSheet('more')} />
-          <Btn icon="close" label="Done" onClick={() => select(null)} />
-        </>
+        <button type="button" className="sel-name" title="Rename layer" onClick={() => renameLayer(layer)}>
+          <span className="sel-icon" style={{ color: layer.label }}>
+            <Icon name={layerIcon(layer)} size={16} />
+          </span>
+          <span className="ellipsis">{layer.name}</span>
+          <Icon name="edit" size={12} className="sel-edit" />
+        </button>
       ) : (
-        <>
-          <Btn icon="pen" label="Draw" active={tool === 'pen'} onClick={() => useEditor.setState({ tool: tool === 'pen' ? 'select' : 'pen' })} />
-          <Btn icon="text" label="Text" onClick={addText} />
-          {hasClip && <Btn icon="paste" label="Paste" onClick={pasteLayer} />}
-          <Btn icon="settings" label="Project" onClick={() => openSheet(matchMedia('(min-width: 900px)').matches ? null : 'project')} />
-          <Btn icon="fit" label="Fit" onClick={() => window.dispatchEvent(new Event('xm:fit'))} />
-        </>
+        <span className="sel-name">
+          <span className="sel-icon">
+            <Icon name="layers" size={16} />
+          </span>
+          <span className="ellipsis">{multi} layers</span>
+        </span>
       )}
+      <div className="sel-acts">
+        {layer ? <Act icon="scissors" label="Split" onClick={() => splitLayer(layer.id)} /> : <Act icon="group" label="Group" onClick={() => groupLayers()} />}
+        <Act icon="copy" label="Duplicate" onClick={() => duplicateLayers(selectedIds())} />
+        <Act icon="trash" label="Delete" onClick={deleteSelection} />
+        <Act icon="more" label="More" onClick={() => openSheet('more')} />
+        <Act icon="check" label="Done" onClick={() => select(null)} />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Phones: the selected layer's property categories (Move & Transform, Effects,
+ * Color & Fill…). Tapping one opens its panel; tapping it again closes it.
+ * With several layers selected, it lists them instead.
+ */
+function CategoryBar() {
+  const project = useEditor((s) => s.project)!;
+  const selectedId = useEditor((s) => s.selectedId);
+  const selection = useEditor((s) => s.selection);
+  const sheet = useEditor((s) => s.sheet);
+  const tab = useEditor((s) => s.propTab);
+  const keyHere = useEditor((s) => !!s.keySel && s.keySel.layerId === s.selectedId);
+  const barRef = useRef<HTMLElement>(null);
+  const layer = selection.length > 1 ? undefined : layerById(project, selectedId);
+  const cats = layer ? layerCategories(layer, keyHere) : [];
+  const current = layer && sheet === 'props' ? (cats.find((c) => c.id === tab) ?? cats.find((c) => c.id !== 'keyframe'))?.id : undefined;
+
+  useEffect(() => {
+    barRef.current?.querySelector('.cat-btn.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [current]);
+
+  if (!layer) {
+    const layers = selection.map((id) => layerById(project, id)).filter((l): l is Layer => !!l);
+    return (
+      <nav className="cat-bar multi" aria-label="Selected layers">
+        {layers.map((l) => (
+          <button key={l.id} type="button" className="cat-chip" title="Edit only this layer" onClick={() => select(l.id)}>
+            <span style={{ color: l.label }}>
+              <Icon name={layerIcon(l)} size={16} />
+            </span>
+            <span className="ellipsis">{l.name}</span>
+          </button>
+        ))}
+      </nav>
+    );
+  }
+  return (
+    <nav className="cat-bar" ref={barRef} aria-label="Layer properties">
+      {cats.map((c) => (
+        <button
+          key={c.id}
+          type="button"
+          className={`cat-btn ${current === c.id ? 'on' : ''} ${c.id === 'keyframe' ? 'key' : ''}`}
+          aria-pressed={current === c.id}
+          onClick={() => (current === c.id ? openSheet(null) : openPanel(c.id))}
+        >
+          <Icon name={c.icon} size={20} />
+          <span>{c.label}</span>
+        </button>
+      ))}
     </nav>
+  );
+}
+
+function PhonePanel() {
+  const project = useEditor((s) => s.project)!;
+  const selectedId = useEditor((s) => s.selectedId);
+  const layer = layerById(project, selectedId);
+  return layer ? <CategoryPanel project={project} layer={layer} /> : null;
+}
+
+/** Android back button: close what is open, step out of the selection, then leave the project. */
+function useEditorBack() {
+  useBackHandler(true, () => {
+    const s = useEditor.getState();
+    if (s.sheet) return openSheet(null);
+    if (s.tool !== 'select') return useEditor.setState({ tool: 'select' });
+    if (s.graph) return openGraph(null);
+    if (s.selectedId || s.selection.length) return select(null);
+    void leaveEditor();
+  });
+}
+
+/** The properties panel belongs to a selected layer: close it once nothing is selected. */
+function useClosePanelOnDeselect() {
+  useEffect(
+    () =>
+      useEditor.subscribe((s, prev) => {
+        if (s.sheet === 'props' && !s.selectedId && prev.selectedId) openSheet(null);
+      }),
+    [],
   );
 }
 

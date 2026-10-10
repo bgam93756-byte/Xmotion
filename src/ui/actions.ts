@@ -1,10 +1,10 @@
-import type { LayerType, ShapeKind, Vec2 } from '../model/types';
-import { createLayer, type NewLayerOpts } from '../model/schema';
+import type { LayerType, Prop, ShapeKind, Vec2 } from '../model/types';
+import { createLayer, nextName, type NewLayerOpts } from '../model/schema';
 import { allLayers, findLayer } from '../model/tree';
 import { media } from '../engine/media';
 import { putAsset } from '../engine/storage';
 import { worldMatrix } from '../engine/transform';
-import { addLayer, deleteLayers, layerById, openSheet, selectedIds, toast, update, useEditor } from '../state/store';
+import { addLayer, deleteLayers, layerById, openPanel, openSheet, selectedIds, toast, update, useEditor } from '../state/store';
 import { saveAsElement } from '../state/elements';
 import { haptic, pickFiles } from '../platform';
 
@@ -17,11 +17,17 @@ function startTime() {
   return time >= project.duration - 0.05 ? 0 : time;
 }
 
-export function addShape(shape: ShapeKind) {
+/**
+ * Adds a shape; `extra` sets more of its properties (e.g. 3 sides for a
+ * triangle), `round` rounds its corners and `base` names it ("Triangle 1").
+ */
+export function addShape(shape: ShapeKind, extra: Record<string, Prop> = {}, round = false, base?: string) {
   const p = get().project;
   if (!p) return;
   const side = Math.round(Math.min(p.width, p.height) * 0.35);
-  addLayer(createLayer(p, 'shape', { shape, start: startTime(), props: { size: { value: [side, side] } } }));
+  const props: Record<string, Prop> = { size: { value: [side, side] }, ...extra };
+  if (round) props.radius = { value: Math.round(side * 0.18) };
+  addLayer(createLayer(p, 'shape', { shape, start: startTime(), props, ...(base ? { name: nextName(p, base) } : {}) }));
   openSheet(null);
   haptic();
 }
@@ -31,7 +37,8 @@ export function addText() {
   if (!p) return;
   const size = Math.round(Math.min(p.width, p.height) * 0.11);
   addLayer(createLayer(p, 'text', { start: startTime(), props: { fontSize: { value: size } } }));
-  openSheet('props');
+  // Straight to the text box (Edit text panel on phones).
+  openPanel('type');
   haptic();
 }
 

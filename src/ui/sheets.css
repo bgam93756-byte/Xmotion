@@ -1,36 +1,23 @@
-/* ---------------- editor: graph editor & bottom bar ---------------- */
+/* ---------------- editor: graph editor ---------------- */
 /* styles.css loads after this file, so overrides of its rules carry an extra class. */
 
 /* The graph editor takes the timeline's place and needs more height; the preview gives some up. */
-.editor.narrow.has-graph {
-  grid-template-rows: auto minmax(0, 1fr) auto clamp(190px, 42vh, 460px) auto;
+.editor.narrow.has-graph:not(.selecting) {
+  grid-template-rows: auto minmax(0, 1fr) auto clamp(190px, 42vh, 460px);
+}
+
+.editor.narrow.selecting.has-graph:not(.editing) {
+  grid-template-rows: auto minmax(0, 1fr) auto clamp(170px, 34vh, 400px) auto auto;
 }
 
 .editor.wide.has-graph {
-  grid-template-rows: auto minmax(0, 1fr) auto clamp(220px, 40vh, 480px) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto clamp(220px, 40vh, 480px);
 }
 
 .ed-timeline.graphing {
   position: relative;
   overflow: hidden;
   background: var(--bg);
-}
-
-/* Seven buttons when a layer is selected: share the width on phones instead of scrolling. */
-@media (max-width: 480px) {
-  .bottombar.bb-selected .bb-btn {
-    flex: 1 1 0;
-    min-width: 0;
-    padding: 4px 1px;
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .bottombar.bb-selected .bb-btn span {
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
 }
 
 /* ---------------- add sheet: objects & elements ---------------- */

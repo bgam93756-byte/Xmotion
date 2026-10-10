@@ -10,9 +10,13 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "ios": "npm run build && cap sync ios && cap open ios",
-    "ios:sync": "npm run build && cap sync ios"
+    "ios:sync": "npm run build && cap sync ios",
+    "android": "npm run build && cap sync android && cap open android",
+    "android:sync": "npm run build && cap sync android"
   },
   "dependencies": {
+    "@capacitor/android": "^8.5.3",
+    "@capacitor/app": "^8.1.2",
     "@capacitor/core": "^8.5.2",
     "@capacitor/filesystem": "^8.1.4",
     "@capacitor/haptics": "^8.0.2",
@@ -35,5 +39,5 @@
     "vite": "^8.3.2",
     "vitest": "^5.0.3"
   },
-  "description": "Xmotion: keyframe motion graphics & video editor for iPhone, iPad and the web"
+  "description": "Xmotion: keyframe motion graphics & video editor for iPhone, iPad, Android and the web"
 }

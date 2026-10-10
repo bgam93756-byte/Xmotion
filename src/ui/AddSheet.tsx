@@ -1,88 +1,98 @@
 import { useEffect, useState } from 'react';
 import { addShape, addSpecial, addText, importMedia } from './actions';
-import { openSheet, useEditor } from '../state/store';
+import { openSheet, pasteLayer, useEditor } from '../state/store';
 import { insertElement, listElements, onElementsChange, removeElement, type ElementRecord } from '../state/elements';
 import { haptic } from '../platform';
 import { Icon, type IconName } from './icons';
+import { useBackHandler } from './back';
 import './sheets.css';
 
-interface Item {
+interface Tile {
   icon: IconName;
   label: string;
+  /** Shown as a tooltip and to screen readers. */
   hint: string;
   run: () => void;
 }
 
-const GROUPS: { title: string; items: Item[] }[] = [
-  {
-    title: 'Media',
-    items: [
-      { icon: 'image', label: 'Photo / Video', hint: 'From your library', run: () => void importMedia('image/*,video/*') },
-      { icon: 'music', label: 'Audio', hint: 'Music, voice, SFX', run: () => void importMedia('audio/*,.mp3,.m4a,.wav,.aac') },
-      { icon: 'text', label: 'Import font', hint: '.ttf .otf .woff', run: () => void importMedia('.ttf,.otf,.woff,.woff2,font/*') },
-    ],
-  },
-  {
-    title: 'Create',
-    items: [
-      { icon: 'text', label: 'Text', hint: '20 fonts + animators', run: addText },
-      { icon: 'rect', label: 'Rectangle', hint: 'Rounded corners', run: () => addShape('rect') },
-      { icon: 'ellipse', label: 'Ellipse', hint: 'Circles & rings', run: () => addShape('ellipse') },
-      { icon: 'polygon', label: 'Polygon', hint: '3–40 sides', run: () => addShape('polygon') },
-      { icon: 'star', label: 'Star', hint: 'Bursts & badges', run: () => addShape('star') },
-      {
-        icon: 'pen',
-        label: 'Draw',
-        hint: 'Freehand vector',
-        run: () => useEditor.setState({ tool: 'pen', sheet: null, selectedId: null, selection: [] }),
-      },
-    ],
-  },
+type Page = 'main' | 'shapes' | 'elements';
+
+const startDrawing = () => useEditor.setState({ tool: 'pen', sheet: null, selectedId: null, selection: [] });
+
+const SHAPES: Tile[] = [
+  { icon: 'rect', label: 'Rectangle', hint: 'Square corners', run: () => addShape('rect') },
+  { icon: 'roundRect', label: 'Rounded', hint: 'Rounded rectangle', run: () => addShape('rect', {}, true, 'Rounded') },
+  { icon: 'ellipse', label: 'Circle', hint: 'Circles, ovals & rings', run: () => addShape('ellipse') },
+  { icon: 'triangle', label: 'Triangle', hint: 'Three-sided polygon', run: () => addShape('polygon', { sides: { value: 3 } }, false, 'Triangle') },
+  { icon: 'polygon', label: 'Polygon', hint: '3 to 40 sides', run: () => addShape('polygon') },
+  { icon: 'star', label: 'Star', hint: 'Bursts & badges', run: () => addShape('star') },
 ];
 
-const OBJECTS: Item[] = [
-  { icon: 'null', label: 'Null object', hint: 'Invisible handle to move many layers via parenting', run: () => addSpecial('null') },
-  { icon: 'camera', label: 'Camera', hint: 'Pan, tilt, zoom and fly through 3D layers', run: () => addSpecial('camera') },
-  { icon: 'adjust', label: 'Adjustment layer', hint: 'Its effects apply to every layer below it', run: () => addSpecial('adjustment') },
-  { icon: 'group', label: 'Group (empty)', hint: 'Folder to move, mask and time layers together', run: () => addSpecial('group') },
-];
-
+/** The "+" menu: layer types as big round buttons, like Alight Motion's. */
 export function AddSheet() {
+  const [page, setPage] = useState<Page>('main');
+  const hasClip = useEditor((s) => !!s.clipboard?.layers.length);
+  useBackHandler(page !== 'main', () => setPage('main'));
+
+  const main: Tile[] = [
+    { icon: 'shapes', label: 'Shapes', hint: 'Rectangles, circles, stars…', run: () => setPage('shapes') },
+    { icon: 'image', label: 'Image & Video', hint: 'From your photo library or files', run: () => void importMedia('image/*,video/*') },
+    { icon: 'music', label: 'Audio', hint: 'Music, voice, sound effects', run: () => void importMedia('audio/*,.mp3,.m4a,.wav,.aac') },
+    { icon: 'text', label: 'Text', hint: '20 fonts and text animators', run: addText },
+    { icon: 'pen', label: 'Drawing', hint: 'Draw a vector line with your finger', run: startDrawing },
+    { icon: 'bookmark', label: 'Elements', hint: 'Layers you saved to reuse', run: () => setPage('elements') },
+    { icon: 'camera', label: 'Camera', hint: 'Pan, tilt, zoom and fly through 3D layers', run: () => addSpecial('camera') },
+    { icon: 'group', label: 'Group', hint: 'An empty group to put layers in', run: () => addSpecial('group') },
+    { icon: 'null', label: 'Null', hint: 'Invisible handle: parent layers to it to move them together', run: () => addSpecial('null') },
+    { icon: 'adjust', label: 'Adjustment', hint: 'Its effects apply to every layer below it', run: () => addSpecial('adjustment') },
+    { icon: 'font', label: 'Font', hint: 'Import a .ttf, .otf or .woff font', run: () => void importMedia('.ttf,.otf,.woff,.woff2,font/*') },
+    ...(hasClip
+      ? [
+          {
+            icon: 'paste' as const,
+            label: 'Paste',
+            hint: 'Paste the copied layers',
+            run: () => {
+              openSheet(null);
+              pasteLayer();
+            },
+          },
+        ]
+      : []),
+  ];
+
+  if (page === 'elements')
+    return (
+      <div className="add-sheet">
+        <SubHead title="Elements" onBack={() => setPage('main')} />
+        <Elements />
+      </div>
+    );
   return (
     <div className="add-sheet">
-      {GROUPS.map((g) => (
-        <div key={g.title} className="add-group">
-          <h4>{g.title}</h4>
-          <div className="add-grid">
-            {g.items.map((it) => (
-              <button key={it.label} type="button" className="add-item" onClick={it.run}>
-                <span className="add-icon">
-                  <Icon name={it.icon} size={22} />
-                </span>
-                <span className="add-label">{it.label}</span>
-                <span className="add-hint">{it.hint}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-      ))}
-      <div className="add-group">
-        <h4>Objects</h4>
-        <div className="add-list">
-          {OBJECTS.map((it) => (
-            <button key={it.label} type="button" className="add-row" onClick={it.run}>
-              <span className="add-icon">
-                <Icon name={it.icon} size={22} />
-              </span>
-              <span className="add-row-text">
-                <span className="add-label">{it.label}</span>
-                <span className="add-hint">{it.hint}</span>
-              </span>
-            </button>
-          ))}
-        </div>
+      {page === 'shapes' && <SubHead title="Shapes" onBack={() => setPage('main')} />}
+      <div className="add-tiles">
+        {(page === 'shapes' ? SHAPES : main).map((t) => (
+          <button key={t.label} type="button" className="add-tile" title={t.hint} aria-label={`${t.label}: ${t.hint}`} onClick={t.run}>
+            <span className="add-round">
+              <Icon name={t.icon} size={24} />
+            </span>
+            <span className="add-tile-label">{t.label}</span>
+          </button>
+        ))}
       </div>
-      <Elements />
+      {page === 'main' && <p className="hint add-foot">Tip: tap a layer on the canvas or in the timeline to edit it.</p>}
+    </div>
+  );
+}
+
+function SubHead({ title, onBack }: { title: string; onBack: () => void }) {
+  return (
+    <div className="add-sub">
+      <button type="button" className="icon-btn" onClick={onBack} aria-label="Back" title="Back">
+        <Icon name="back" />
+      </button>
+      <b>{title}</b>
     </div>
   );
 }
@@ -115,7 +125,6 @@ function Elements() {
 
   return (
     <div className="add-group">
-      <h4>Elements</h4>
       {items && !items.length && <p className="hint el-empty">Select layers, then More › Save as element to reuse them in any project.</p>}
       {!!items?.length && (
         <div className="el-grid">

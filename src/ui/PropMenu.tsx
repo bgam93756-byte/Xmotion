@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useBackHandler } from './back';
 import { createPortal } from 'react-dom';
 import type { Layer } from '../model/types';
 import { getProp, type PropDef } from '../model/schema';
@@ -23,6 +24,7 @@ export function PopoverMenu({ anchor, title, items, onClose }: { anchor: DOMRect
   const ref = useRef<HTMLDivElement>(null);
   const close = useRef(onClose);
   close.current = onClose;
+  useBackHandler(true, () => close.current());
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
 
   // Below the anchor when it fits, otherwise above; always inside the viewport.
