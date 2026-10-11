@@ -1,5 +1,8 @@
-import type { LayerType, Prop, ShapeKind, Vec2 } from '../model/types';
+import type { LayerType, Project, Prop, ShapeKind, Vec2 } from '../model/types';
 import { createLayer, nextName, type NewLayerOpts } from '../model/schema';
+import { canReplace, replaceWithMedia } from '../model/replace';
+import { NATE, applyNateStyle, hasNateStyle, type Beat, type NateResult } from '../model/nate';
+import { detectOnsets, monoOf } from '../engine/beats';
 import { allLayers, findLayer } from '../model/tree';
 import { media } from '../engine/media';
 import { putAsset } from '../engine/storage';
@@ -162,4 +165,83 @@ export async function importFiles(files: File[]) {
       toast((e as Error).message || `Couldn't import ${file.name}`);
     }
   }
+}
+
+/* ---------------- Replace ---------------- */
+
+export { canReplace };
+
+/**
+ * Replace, like Alight Motion's: swaps a photo, video or template clip slot
+ * for another photo or video, keeping its timing, animation and effects.
+ */
+export async function replaceMedia(layerId: string) {
+  const [file] = await pickFiles('image/*,video/*', false);
+  const p0 = get().project;
+  const l0 = p0 && layerById(p0, layerId);
+  if (!file || !l0 || !canReplace(l0)) return;
+  try {
+    toast(`Importing ${file.name}…`);
+    const meta = await media.probe(file);
+    if (meta.kind !== 'image' && meta.kind !== 'video') return toast('Pick a photo or a video');
+    await putAsset(meta, file);
+    await media.register(meta, file);
+    update((d) => {
+      const l = layerById(d, layerId);
+      if (l) replaceWithMedia(d, l, meta);
+    });
+    haptic();
+    toast(`Replaced with ${file.name}`);
+  } catch (e) {
+    toast((e as Error).message || `Couldn't import ${file.name}`);
+  }
+}
+
+/* ---------------- Nate style ---------------- */
+
+/** Beats of the project's music (top-level audio layers), in comp time. */
+async function musicBeats(p: Project): Promise<Beat[]> {
+  const out: Beat[] = [];
+  for (const l of p.layers) {
+    if (l.type !== 'audio' || !l.asset || l.muted || !l.visible) continue;
+    const buf = await media.audioBuffer(l.asset);
+    if (!buf) continue;
+    const speed = l.speed ?? 1;
+    const trim = l.trimIn ?? 0;
+    for (const o of detectOnsets(monoOf(buf), buf.sampleRate)) {
+      const t = l.start + (o.t - trim) / speed;
+      if (t >= l.start && t < l.end) out.push({ t, strength: o.strength });
+    }
+  }
+  return out;
+}
+
+/**
+ * One tap Nate-style edit of the open project: its clips get the blue intro,
+ * chrome name, glowing quote, hits, spins and flashes, synced to the beats
+ * of its music when it has some. Tapping it again re-syncs (one undo step).
+ */
+export async function applyNateStyleNow() {
+  const p = get().project;
+  if (!p) return;
+  openSheet(null);
+  // Already styled: its clips are in the "Nate · clips" group, and tapping again re-syncs.
+  if (!hasNateStyle(p) && !p.layers.some((l) => l.type !== 'audio' && l.type !== 'camera' && !l.name.startsWith(NATE))) {
+    toast('Add your clips first (+ › Image & Video), then tap Nate style');
+    return;
+  }
+  const hasMusic = p.layers.some((l) => l.type === 'audio' && l.asset);
+  if (hasMusic) toast('Finding the beats…');
+  const beats = hasMusic ? await musicBeats(p) : [];
+  let result: NateResult | null = null;
+  update((d) => {
+    result = applyNateStyle(d, { beats });
+  });
+  const r = result as NateResult | null;
+  if (!r) return;
+  useEditor.setState({ time: 0 });
+  haptic('medium');
+  toast(
+    `Nate style: ${r.hits} hits, ${r.spins} spins, ${r.flashes} flashes${r.beatSynced ? ' on the beat' : ''}. Edit “Nate · name” and “Nate · quote”; Undo removes it.`,
+  );
 }

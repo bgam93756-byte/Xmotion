@@ -40,7 +40,7 @@ import { MoreSheet } from './MoreSheet';
 import { HelpSheet } from './HelpSheet';
 import { Icon, type IconName } from './icons';
 import { IconButton } from './controls/fields';
-import { deleteSelection, importFiles, selectAll } from './actions';
+import { deleteSelection, importFiles, replaceMedia, selectAll } from './actions';
 import { useBackHandler } from './back';
 import './sheets.css';
 
@@ -278,7 +278,13 @@ function SelectionBar() {
         </span>
       )}
       <div className="sel-acts">
-        {layer ? <Act icon="scissors" label="Split" onClick={() => splitLayer(layer.id)} /> : <Act icon="group" label="Group" onClick={() => groupLayers()} />}
+        {layer?.placeholder ? (
+          <Act icon="image" label="Replace" onClick={() => void replaceMedia(layer.id)} />
+        ) : layer ? (
+          <Act icon="scissors" label="Split" onClick={() => splitLayer(layer.id)} />
+        ) : (
+          <Act icon="group" label="Group" onClick={() => groupLayers()} />
+        )}
         <Act icon="copy" label="Duplicate" onClick={() => duplicateLayers(selectedIds())} />
         <Act icon="trash" label="Delete" onClick={deleteSelection} />
         <Act icon="more" label="More" onClick={() => openSheet('more')} />

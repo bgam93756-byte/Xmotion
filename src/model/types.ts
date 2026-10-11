@@ -98,6 +98,8 @@ export interface Layer {
   collapsed?: boolean;
   /** Timeline label color. */
   label?: string;
+  /** A template's clip slot: Replace swaps in a photo or video and keeps its animation. */
+  placeholder?: boolean;
   props: Record<string, Prop>;
   effects: Effect[];
 

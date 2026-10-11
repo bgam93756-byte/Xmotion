@@ -154,7 +154,8 @@ export const BLUR_EFFECTS: EffectSpec[] = [
     category: 'Blur & Sharpen',
     description: 'Creates blur radiating toward or away from a center.',
     props: [pct('amount', 'Strength', 25), point('center', 'Center')],
-    passes: (e) => [{ frag: ZOOM, u: { u_c: uvOf(e, e.pt('center')), u_amount: e.n('amount') / 100 } }],
+    // At 0 (e.g. between keyframed hits) it is skipped, so it costs nothing.
+    passes: (e) => (e.n('amount') > 0.05 ? [{ frag: ZOOM, u: { u_c: uvOf(e, e.pt('center')), u_amount: e.n('amount') / 100 } }] : []),
   },
   {
     type: 'spinBlur',
@@ -162,7 +163,7 @@ export const BLUR_EFFECTS: EffectSpec[] = [
     category: 'Blur & Sharpen',
     description: 'Blurs content around a rotation center.',
     props: [num('angle', 'Angle', 20, 0, 360, { unit: '°' }), point('center', 'Center')],
-    passes: (e) => [{ frag: SPIN, u: { u_c: glPx(e, e.pt('center')), u_angle: e.n('angle') * DEG } }],
+    passes: (e) => (e.n('angle') > 0.05 ? [{ frag: SPIN, u: { u_c: glPx(e, e.pt('center')), u_angle: e.n('angle') * DEG } }] : []),
   },
   {
     type: 'lensBlur',

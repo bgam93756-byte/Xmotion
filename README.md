@@ -8,6 +8,12 @@ It works like Alight Motion:
 - Each panel's ◆ keyframes its main properties at once.
 - Effects are browsed by category, with search.
 - Gestures: drag a layer to move it, put two fingers on a layer to move, scale and rotate it at once, and pinch the empty canvas to zoom.
+- **Replace** swaps a photo, video or template clip slot for another one and keeps its timing, keyframes and effects.
+- **Nate style** (+ menu, or the **Nate video** template) turns your clips into a TikTok-style edit:
+  - a deep blue intro with a chrome name and a glowing, colour-cycling quote, and letterbox bars;
+  - on every cut or beat, a shake with a zoom punch, a white flash, or a 180° spin transition;
+  - a punchy grade and motion blur.
+  If the project has music, the hits land on its beats (detected on the device). Tap it again to re-sync after changing clips or music.
 
 The code and design are Xmotion's own; it doesn't contain any Alight Motion code or assets.
 

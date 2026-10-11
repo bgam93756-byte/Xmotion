@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { addShape, addSpecial, addText, importMedia } from './actions';
+import { addShape, addSpecial, addText, applyNateStyleNow, importMedia } from './actions';
 import { openSheet, pasteLayer, useEditor } from '../state/store';
 import { insertElement, listElements, onElementsChange, removeElement, type ElementRecord } from '../state/elements';
 import { haptic } from '../platform';
@@ -46,6 +46,12 @@ export function AddSheet() {
     { icon: 'null', label: 'Null', hint: 'Invisible handle: parent layers to it to move them together', run: () => addSpecial('null') },
     { icon: 'adjust', label: 'Adjustment', hint: 'Its effects apply to every layer below it', run: () => addSpecial('adjustment') },
     { icon: 'font', label: 'Font', hint: 'Import a .ttf, .otf or .woff font', run: () => void importMedia('.ttf,.otf,.woff,.woff2,font/*') },
+    {
+      icon: 'sparkle',
+      label: 'Nate style',
+      hint: 'One-tap edit of your clips: blue intro, chrome name, shakes, spins and flashes on the beat',
+      run: () => void applyNateStyleNow(),
+    },
     ...(hasClip
       ? [
           {

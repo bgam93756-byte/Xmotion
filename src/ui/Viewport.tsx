@@ -353,6 +353,14 @@ export function Viewport() {
       ctx.setLineDash([]);
     }
 
+    // Template clip slots say what they are (editor only, never rendered or exported).
+    if (!s.playing)
+      for (const l of allLayers(p)) {
+        if (!l.placeholder || !activeAt(p, l, t)) continue;
+        const c = toCompSpace(p, l, t, [[0, 0]], cam);
+        if (c) slotLabel(ctx, l.name, toScreen(c[0]));
+      }
+
     const sl = snapLines.current;
     if (sl) {
       ctx.strokeStyle = SNAP;
@@ -464,6 +472,27 @@ export function Viewport() {
       ctx.setLineDash([]);
       if (d?.kind === 'guide') label(ctx, off(d.axis, d.value) ? 'Remove' : `${d.axis === 'v' ? 'x' : 'y'} ${d.value}`, d.pt[0] + 14, d.pt[1] - 18);
     }
+    ctx.restore();
+  }
+
+  /** "Clip 3 · Replace with your video" pill on a template clip slot. */
+  function slotLabel(ctx: CanvasRenderingContext2D, name: string, [x, y]: Vec2) {
+    const sub = 'Tap it, then Replace with your video';
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '700 15px system-ui, sans-serif';
+    const w = Math.max(ctx.measureText(name).width, (ctx.font = '500 11px system-ui, sans-serif', ctx.measureText(sub).width)) + 28;
+    ctx.fillStyle = 'rgba(11,12,16,0.72)';
+    ctx.beginPath();
+    ctx.roundRect(x - w / 2, y - 24, w, 48, 12);
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '700 15px system-ui, sans-serif';
+    ctx.fillText(name, x, y - 8);
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.font = '500 11px system-ui, sans-serif';
+    ctx.fillText(sub, x, y + 11);
     ctx.restore();
   }
 

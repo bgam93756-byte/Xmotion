@@ -11,6 +11,8 @@ export const FONT_LIST: { family: string; category: string }[] = [
   { family: 'Righteous', category: 'Display' },
   { family: 'Bungee', category: 'Display' },
   { family: 'Monoton', category: 'Display' },
+  { family: 'Orbitron', category: 'Display' },
+  { family: 'Michroma', category: 'Display' },
   { family: 'Press Start 2P', category: 'Pixel' },
   { family: 'Playfair Display', category: 'Serif' },
   { family: 'DM Serif Display', category: 'Serif' },

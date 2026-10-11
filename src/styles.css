@@ -2612,3 +2612,19 @@ code {
     border-radius: 0;
   }
 }
+
+/* A template clip slot in the Shape panel. */
+.slot-note {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+  padding: 10px 12px;
+  margin: 2px 0 10px;
+  border: 1px dashed rgba(124, 92, 255, 0.6);
+  border-radius: 12px;
+  background: rgba(124, 92, 255, 0.1);
+}
+
+.slot-note .hint {
+  margin: 0;
+}

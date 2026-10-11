@@ -171,9 +171,10 @@ const set = useEditor.setState;
 export function toast(msg: string) {
   const id = Date.now();
   set({ toast: { msg, id } });
+  // Long messages stay up long enough to read.
   setTimeout(() => {
     if (get().toast?.id === id) set({ toast: null });
-  }, 2600);
+  }, Math.max(2600, msg.length * 45));
 }
 
 /* ---------------- project & history ---------------- */

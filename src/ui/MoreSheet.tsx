@@ -16,7 +16,7 @@ import {
   ungroup,
   useEditor,
 } from '../state/store';
-import { deleteSelection, saveSelectionAsElement, selectAll } from './actions';
+import { canReplace, deleteSelection, replaceMedia, saveSelectionAsElement, selectAll } from './actions';
 import { Icon, type IconName } from './icons';
 import './sheets.css';
 
@@ -58,6 +58,7 @@ export function MoreSheet() {
           },
         }
       : null,
+    single && canReplace(single) ? { icon: 'image', label: 'Replace with photo or video', run: () => void replaceMedia(single.id) } : null,
     { icon: 'copy', label: 'Copy', keys: `${MOD}C`, disabled: none, run: () => copyLayers(ids) },
     { icon: 'paste', label: 'Paste', keys: `${MOD}V`, disabled: !hasClip, run: pasteLayer },
     { icon: 'layers', label: 'Duplicate', keys: `${MOD}D`, disabled: none, run: () => duplicateLayers(ids) },

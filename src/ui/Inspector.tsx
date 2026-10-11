@@ -47,6 +47,7 @@ import {
 } from '../state/store';
 import { saveAsElement } from '../state/elements';
 import { BezierEditor, easePreview } from './controls/BezierEditor';
+import { replaceMedia } from './actions';
 import { ColorField, IconButton, NumberField, Section, Select, Slider, Toggle } from './controls/fields';
 import { Icon, type IconName } from './icons';
 import { PropMenu, type MenuItem } from './PropMenu';
@@ -587,6 +588,14 @@ function TypeBody({ project, layer }: { project: Project; layer: Layer }) {
     case 'shape':
       return (
         <>
+          {layer.placeholder && (
+            <div className="slot-note">
+              <p className="hint">This is a clip slot of the template. Replace it with your photo or video: the timing, shakes and effects stay.</p>
+              <button type="button" className="btn primary small" onClick={() => void replaceMedia(id)}>
+                <Icon name="image" size={14} /> Replace with photo or video
+              </button>
+            </div>
+          )}
           {layer.shape !== 'path' ? (
             <div className="seg">
               {(['rect', 'ellipse', 'polygon', 'star'] as ShapeKind[]).map((k) => (
@@ -705,6 +714,11 @@ function TypeBody({ project, layer }: { project: Project; layer: Layer }) {
           <div className="row">
             <span className="row-label">Source</span>
             <span className="row-value ellipsis">{a?.meta.name ?? 'Missing media'}</span>
+            {layer.type !== 'audio' && (
+              <button type="button" className="chip" title="Swap in another photo or video, keeping the animation" onClick={() => void replaceMedia(id)}>
+                Replace
+              </button>
+            )}
           </div>
           {layer.type !== 'audio' && (
             <div className="row">

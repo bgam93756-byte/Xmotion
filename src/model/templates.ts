@@ -1,6 +1,7 @@
 import type { EaseName, Effect, Keyframe, Layer, Project, Prop, PropValue, Vec2 } from './types';
 import { createEffect, createLayer, createProject, defaultZoom } from './schema';
 import { uid } from './ids';
+import { applyNateStyle } from './nate';
 
 const k = (t: number, v: PropValue, ease: EaseName = 'easeInOut'): Keyframe => ({ id: uid('k'), t, v, ease });
 
@@ -15,7 +16,22 @@ export interface Template {
   name: string;
   description: string;
   build: () => Project;
+  /** Time shown on its card (default 1.6 s). */
+  thumbAt?: number;
 }
+
+/** Clip slots of the Nate video template: [start, end, gradient colors]. */
+const NATE_SLOTS: [number, number, string, string][] = [
+  [0, 1.6, '#1d4ed8', '#93c5fd'],
+  [1.6, 2.4, '#7c5cff', '#ff5c8a'],
+  [2.4, 3.1, '#00b3a4', '#1e3a8a'],
+  [3.1, 3.9, '#ff7a18', '#c9184a'],
+  [3.9, 4.7, '#13b25e', '#0d6e8a'],
+  [4.7, 5.4, '#d63af9', '#6a1b9a'],
+  [5.4, 6.2, '#ffd23f', '#ee6c4d'],
+  [6.2, 7.0, '#22d3ee', '#4338ca'],
+  [7.0, 8.0, '#ef4444', '#7e22ce'],
+];
 
 function add(p: Project, l: Layer) {
   // A new array rather than push(): the layer tree index (findLayer, parents) is cached per array.
@@ -65,6 +81,35 @@ function hills(p: Project, name: string, z: number, y: number, w: number, tops: 
 }
 
 export const TEMPLATES: Template[] = [
+  {
+    id: 'nate',
+    name: 'Nate video',
+    description: 'Nate-style edit: blue intro, chrome name, shakes, spins & flashes. Replace the clips with yours.',
+    thumbAt: 0.9,
+    build: () => {
+      const p = createProject({ name: 'Nate video', width: 1080, height: 1920, fps: 30, duration: 8, background: '#000000' });
+      // Clip slots to Replace with your videos (select one › Replace); everything stays synced.
+      p.layers = NATE_SLOTS.map(([start, end, c1, c2], i) =>
+        createLayer(p, 'shape', {
+          name: `Clip ${i + 1}`,
+          shape: 'rect',
+          placeholder: true,
+          fillType: 'linear',
+          start,
+          end,
+          props: {
+            position: { value: [540, 960] },
+            size: { value: [1080, 1920] },
+            fill: { value: c1 },
+            fill2: { value: c2 },
+            gradAngle: { value: 60 + i * 35 },
+          },
+        }),
+      );
+      applyNateStyle(p);
+      return p;
+    },
+  },
   {
     id: 'neon',
     name: 'Neon Title',

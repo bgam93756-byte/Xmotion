@@ -88,7 +88,7 @@ export function Home() {
       await open(p);
     });
 
-  const templateThumbs = useMemo(() => TEMPLATES.map((t) => safeThumb(t.build(), 1.6)), []);
+  const templateThumbs = useMemo(() => TEMPLATES.map((t) => safeThumb(t.build(), t.thumbAt ?? 1.6)), []);
 
   return (
     <div className="home">

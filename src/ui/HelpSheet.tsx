@@ -59,6 +59,8 @@ const LEARN: [string, string][] = [
 ];
 
 const TOPICS: [string, string][] = [
+  ['Nate style', 'Add your clips (and a song), then + › Nate style: a blue intro with a chrome name and a glowing quote, letterbox bars, and on every cut or beat a shake, a flash or a spin. Change the name and quote in “Nate · name” and “Nate · quote”. Tap it again after changing clips or music to re-sync; Undo removes it. Or start from the Nate video template.'],
+  ['Replace', 'Select a photo, video or a template’s clip slot › Replace (or More › Replace with photo or video). The new media fills the same area and keeps the timing, keyframes and effects.'],
   ['Groups', 'Select several layers (long-press or Ctrl-click in the timeline) › More › Group (Ctrl+G). A group moves, fades, masks and retimes its layers as one; double-tap a layer inside it on the canvas to edit that layer.'],
   ['Elements', 'Select layers › More › Save as element. + › Elements inserts them into any project at the playhead, with their media and fonts.'],
   ['Border & shadow', 'Border & Shadow: a border (stroke) and a drop shadow for any layer; photos and videos get a sticker-style outline.'],
